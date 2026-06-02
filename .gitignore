@@ -1,0 +1,56 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Distribution / packaging
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swoi
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Project artifacts (weights, metrics, training runs — keep folder only in git)
+models/**
+!models/.gitkeep
+
+outputs/*
+!outputs/.gitkeep
+
+# Datasets (keep folder structure but ignore actual data)
+data/raw/*
+data/cvat/*
+data/yolo/*
+data/action/*
+!data/raw/.gitkeep
+!data/cvat/.gitkeep
+!data/yolo/.gitkeep
+!data/action/.gitkeep
+
+# Notebook checkpoints
+.ipynb_checkpoints/
+
+# Logs
+*.log
+wandb/
+
+# Stray Ultralytics downloads in repo root (canonical copies live under models/)
+yolo26n-cls.pt
+yolo26n.pt

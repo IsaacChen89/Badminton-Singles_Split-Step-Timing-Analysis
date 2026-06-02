@@ -1,0 +1,113 @@
+# Badminton Singles - Split Step Timing Analysis
+# Default runtime configuration. Any field can be overridden on the CLI.
+
+# General
+device: auto              # auto | cpu | cuda | mps  (auto: cuda > mps > cpu)
+seed: 42
+log_level: INFO
+
+# Inference pipeline
+pipeline:
+  frame_skip: 1           # process every Nth frame (1 = no skip)
+  # Auto-resample any input video to this FPS before processing so the action
+  # model sees the same temporal cadence (30 FPS) it was trained on. Set to
+  # null (or pass --target-fps 0) to disable and use the source FPS instead.
+  target_fps: 30
+  output_fps: null        # null = use target_fps (or source FPS when disabled)
+  draw_hud: true          # draw frame/time/FPS in top-left
+
+# Detection (YOLO)
+detection:
+  model_path: models/yolo_player/yolo26n.pt  # stock base weights; ultralytics cache if missing
+  finetuned_model_path: models/yolo_player_best.pt  # used when present (retrain after switching to YOLO26)
+  conf_threshold: 0.35
+  iou_threshold: 0.5      # kept for API compat; YOLO26 is NMS-free at inference
+  imgsz: 640
+  classes: [0]            # COCO 'person' when using stock yolo26n; ignored for fine-tuned single-class model
+  max_det: 8
+
+# Tracking
+# 'mode' is the one knob most users tweak.
+#   strong       -> BoT-SORT + Re-ID + long track buffer + trajectory + smoothing (default)
+#   normal       -> BoT-SORT defaults + sticky map (lighter / faster)
+#   court_side   -> ignore tracker IDs entirely; reassign by court half each frame
+# Set tracker_yaml to 'auto' to let mode pick the right one. You can also point
+# it at any custom path or the stock 'botsort.yaml' / 'bytetrack.yaml'.
+tracking:
+  mode: strong
+  tracker_yaml: auto
+  persist: true
+  show_tracker_ids: false   # overlay raw tracker IDs on the video (useful for debugging)
+
+# Player assignment (red = player1, blue = player2)
+# In broadcast badminton singles the camera is usually behind one baseline,
+# so 'top' (upper court) is Player 1 by default. For a side-on camera angle
+# use 'left' or 'right'.
+assignment:
+  player1_position: top      # top | bottom | left | right
+  top_is_player1: true       # legacy alias; ignored unless player1_position is at its default
+  reassign_after_lost_frames: 60
+  bbox_smoothing_alpha: 0.5  # 1.0 disables; lower = smoother but laggier rendered bbox
+  velocity_alpha: 0.4        # smoothing on per-frame bbox velocity for prediction
+  predict_max_frames: 12     # render predicted bbox for up to this many missing frames
+  min_confidence: 0.25       # drop detections below this YOLO confidence
+  iou_recovery_threshold: 0.2  # min IoU vs. predicted bbox to recover a lost slot
+
+# Action recognition (CNN-LSTM)
+action:
+  model_checkpoint: models/action_player/action_best.pt  # may not exist on first run
+  clip_length: 16          # T frames per clip
+  clip_stride: 1
+  input_size: 224
+  num_classes: 2
+  backbone: resnet18
+  freeze_backbone: true
+  lstm_hidden: 128
+  lstm_layers: 1
+  bidirectional: true
+
+# Smoothing of split-step label
+smoothing:
+  ema_alpha: 0.4           # EMA over per-frame split-step probability
+  prob_on: 0.6             # probability to flip to ON (must be sustained for min_on_frames)
+  prob_off: 0.4            # probability to flip back to OFF (must be sustained for cooldown_frames)
+  min_on_frames: 3         # minimum sustained frames to declare a split step
+  cooldown_frames: 6       # minimum sustained low-prob frames to clear it
+
+# Training (action model)
+# All artifacts go under models/action_player/ (history, plots, checkpoints).
+train_action:
+  epochs: 30
+  batch_size: 16
+  lr: 0.0003
+  weight_decay: 0.0001
+  num_workers: 2
+  val_split: 0.2
+  class_weight_balance: true
+  amp: true                # mixed precision when CUDA available
+  output_dir: models/action_player
+
+# Training (YOLO detector via ultralytics)
+# Stock base: models/yolo_player/yolo26n.pt
+# Training outputs: models/yolo_player/weights/best.pt, results.csv, plots, etc.
+train_yolo:
+  base_model: models/yolo_player/yolo26n.pt
+  epochs: 50
+  imgsz: 640
+  batch: 16
+  project: models
+  name: yolo_player
+
+# CVAT conversion defaults
+cvat:
+  # When both labels are the same (e.g. "Player"), track id 0 -> player 1,
+  # track id 1 -> player 2. Use player1/player2 for the README convention.
+  player1_label: Player
+  player2_label: Player
+  split_attribute: movement_state
+  yolo_class_name: player
+  # Three-way split (train share is implicit: 1 - val_split - test_split).
+  # Defaults give 60% train / 20% val / 20% test.
+  val_split: 0.2
+  test_split: 0.2
+  every_n_frames: 1        # subsample frames when exporting YOLO images

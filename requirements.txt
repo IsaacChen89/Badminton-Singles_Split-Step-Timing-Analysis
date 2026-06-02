@@ -1,0 +1,24 @@
+# Core deep learning
+torch==2.12.0
+torchvision==0.27.0
+
+# Detection / tracking
+ultralytics==8.4.57
+supervision==0.22.0
+# lapx is a maintained, wheel-shipping drop-in for `lap` (imports as `lap`).
+# The original `lap==0.4.0` sdist fails to build on modern setuptools (py3.12).
+lapx==0.5.11
+
+# Vision / data
+opencv-python==4.10.0.84
+numpy==1.26.4
+pandas==2.2.2
+scikit-learn==1.5.1
+Pillow==10.4.0
+
+# Config / CLI / logging
+PyYAML==6.0.2
+typer==0.12.5
+click==8.1.7  # typer 0.12.x breaks with click>=8.4 (boolean flags like --auto fail)
+rich==13.7.1
+tqdm==4.66.5

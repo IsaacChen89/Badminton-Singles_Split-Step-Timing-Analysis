@@ -1,0 +1,16 @@
+# BoT-SORT defaults ("normal" mode) — Re-ID off for speed.
+# Keeps the same buffer/thresholds as the stock ultralytics botsort.yaml.
+
+tracker_type: botsort
+track_high_thresh: 0.25
+track_low_thresh: 0.10
+new_track_thresh: 0.25
+track_buffer: 30
+match_thresh: 0.80
+fuse_score: True
+
+gmc_method: sparseOptFlow
+proximity_thresh: 0.50
+appearance_thresh: 0.25
+with_reid: False
+model: auto
