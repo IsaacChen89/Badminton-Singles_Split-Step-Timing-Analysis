@@ -127,7 +127,7 @@ Useful options:
 | `--frame-skip 2`                                    | Run detection/tracking only on every 2nd frame (≈2× faster).                                       |
 | `--target-fps 30`                                   | Resample the input video to this FPS before processing (default 30, pass 0 to disable).            |
 | `--device cpu` / `--device cuda` / `--device mps` | Force device (default `auto`: cuda → mps → cpu). |
-| `--yolo-weights models/yolo_player_best.pt`         | Use a fine-tuned YOLO checkpoint.                                                                  |
+| `--yolo-weights models/yolo_player/yolo_player_best.pt` | Use a fine-tuned YOLO checkpoint.                                                              |
 | `--action-weights models/action_player/action_best.pt` | Use a specific action checkpoint.                                                               |
 | `--no-hud`                                          | Hide the corner HUD.                                                                               |
 | `--max-frames 600`                                  | Stop after 600 frames (debugging).                                                                 |
@@ -168,7 +168,7 @@ Set `--player1-position` or `assignment.player1_position` to match your camera:
 - Start with **`--tracking-mode strong`** (default).
 - Match **`player1_position`** to your camera (end-on → `top`; side-on → `left`/`right`).
 - Use **`--debug-ids`** once; churning IDs → raise **`--min-confidence`** or fine-tune YOLO.
-- Fine-tuned **`yolo_player_best.pt`** reduces ID swaps more than tracker tweaks alone.
+- Fine-tuned **`models/yolo_player/yolo_player_best.pt`** reduces ID swaps more than tracker tweaks alone.
 - **`strong`** mode uses `models/yolo_player/yolo26n-cls.pt` for Re-ID (not the repo root).
 
 All tuning knobs are under `tracking:` and `assignment:` in `config.yaml`.
@@ -364,11 +364,7 @@ python main.py train-yolo \
   --batch 16
 ```
 
-Trained weights land at `models/yolo_player/weights/best.pt`. Copy or symlink them into `models/yolo_player_best.pt` (the path `config.yaml` checks first), then `analyze` will use the fine-tuned detector automatically:
-
-```bash
-cp models/yolo_player/weights/best.pt models/yolo_player_best.pt
-```
+Training writes run artifacts under `models/yolo_player/` (`weights/best.pt`, `results.csv`, plots, …). When training finishes, **`train-yolo` automatically copies** `weights/best.pt` → `models/yolo_player/yolo_player_best.pt` for `analyze`.
 
 ---
 
