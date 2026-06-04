@@ -31,7 +31,7 @@ class PipelineConfig:
 @dataclass
 class DetectionConfig:
     model_path: str = "models/yolo_player/yolo26n.pt"
-    finetuned_model_path: str = "models/yolo_player_best.pt"
+    finetuned_model_path: str = "models/yolo_player/yolo_player_best.pt"
     conf_threshold: float = 0.35
     iou_threshold: float = 0.5
     imgsz: int = 640

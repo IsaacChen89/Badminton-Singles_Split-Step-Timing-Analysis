@@ -31,26 +31,6 @@ app = typer.Typer(
 )
 
 
-def _resolve_train_base_model(base: str) -> str:
-    """Resolve training base model to a stable local path when possible.
-
-    This avoids Ultralytics re-downloading a second copy into the repo root
-    when users pass shorthand names like ``yolo26n.pt`` (also checks
-    ``models/yolo_player/``).
-    """
-    p = Path(base)
-    if p.exists():
-        return str(p)
-    local_models = Path("models") / base
-    if local_models.exists():
-        return str(local_models)
-    # Default stock layout: models/yolo_player/<name>.pt
-    yolo_player = Path("models") / "yolo_player" / Path(base).name
-    if yolo_player.exists():
-        return str(yolo_player)
-    return base
-
-
 # -------------------------------------------------------------------- #
 # analyze
 # -------------------------------------------------------------------- #
@@ -450,24 +430,41 @@ def train_yolo(
 
     from ultralytics import YOLO
 
-    base = _resolve_train_base_model(base_model or cfg.train_yolo.base_model)
+    from src.utils.yolo_weights import (
+        YOLO_PLAYER_DIR,
+        promote_finetuned_best,
+        remove_stray_root_weight,
+        resolve_yolo_weight,
+        ultralytics_weights_cwd,
+    )
+
+    base_spec = base_model or cfg.train_yolo.base_model
+    base_path = resolve_yolo_weight(base_spec)
     save_dir = (Path(cfg.train_yolo.project) / cfg.train_yolo.name).resolve()
     logger = get_logger("train_yolo")
-    logger.info(f"Training YOLO from base '{base}' on {data}")
+    logger.info(f"Training YOLO from base '{base_path}' on {data}")
     logger.info(f"Saving run artifacts to {save_dir}")
-    model = YOLO(base)
-    results = model.train(
-        data=str(data),
-        epochs=epochs or cfg.train_yolo.epochs,
-        imgsz=imgsz or cfg.train_yolo.imgsz,
-        batch=batch or cfg.train_yolo.batch,
-        device=resolved_device,
-        save_dir=str(save_dir),
-        exist_ok=True,
-    )
-    logger.info(
-        f"YOLO training complete. Weights: {save_dir / 'weights' / 'best.pt'}"
-    )
+
+    load_target = str(base_path) if base_path.is_file() else base_spec
+    with ultralytics_weights_cwd(YOLO_PLAYER_DIR.resolve()):
+        model = YOLO(load_target)
+        remove_stray_root_weight(Path(load_target).name, keep=base_path if base_path.is_file() else None)
+        results = model.train(
+            data=str(data),
+            epochs=epochs or cfg.train_yolo.epochs,
+            imgsz=imgsz or cfg.train_yolo.imgsz,
+            batch=batch or cfg.train_yolo.batch,
+            device=resolved_device,
+            save_dir=str(save_dir),
+            exist_ok=True,
+        )
+    remove_stray_root_weight("yolo26n.pt", keep=YOLO_PLAYER_DIR / "yolo26n.pt")
+
+    best_src = save_dir / "weights" / "best.pt"
+    promoted = promote_finetuned_best(save_dir)
+    if promoted:
+        logger.info(f"Fine-tuned detector for analyze: {promoted}")
+    logger.info(f"YOLO training complete. Run weights: {best_src}")
 
 
 # -------------------------------------------------------------------- #

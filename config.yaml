@@ -19,7 +19,7 @@ pipeline:
 # Detection (YOLO)
 detection:
   model_path: models/yolo_player/yolo26n.pt  # stock base weights; ultralytics cache if missing
-  finetuned_model_path: models/yolo_player_best.pt  # used when present (retrain after switching to YOLO26)
+  finetuned_model_path: models/yolo_player/yolo_player_best.pt  # promoted after train-yolo
   conf_threshold: 0.35
   iou_threshold: 0.5      # kept for API compat; YOLO26 is NMS-free at inference
   imgsz: 640
@@ -89,7 +89,7 @@ train_action:
 
 # Training (YOLO detector via ultralytics)
 # Stock base: models/yolo_player/yolo26n.pt
-# Training outputs: models/yolo_player/weights/best.pt, results.csv, plots, etc.
+# Outputs: models/yolo_player/weights/best.pt (+ auto-copy to yolo_player_best.pt)
 train_yolo:
   base_model: models/yolo_player/yolo26n.pt
   epochs: 50

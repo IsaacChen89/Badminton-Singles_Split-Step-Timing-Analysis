@@ -35,10 +35,16 @@ def _select_model_path(
     fallback: str,
 ) -> str:
     """Pick the fine-tuned weights when present, else fall back to stock."""
-    if primary and Path(primary).exists():
-        return primary
-    if fallback and Path(fallback).exists():
-        return fallback
+    from ..utils.yolo_weights import resolve_yolo_weight
+
+    if primary:
+        resolved = resolve_yolo_weight(primary)
+        if resolved.is_file():
+            return str(resolved)
+    if fallback:
+        resolved = resolve_yolo_weight(fallback)
+        if resolved.is_file():
+            return str(resolved)
     # Last resort: ask ultralytics to download the stock checkpoint by name.
     return fallback or primary
 
