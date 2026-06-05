@@ -4,7 +4,7 @@
 #   behind their partner / the umpire chair and still be recovered.
 # - Tighter new_track_thresh + match_thresh reduce spurious ID swaps.
 # Re-ID weights for YOLO26 (end-to-end detect heads cannot supply native Re-ID features).
-# Keep the file under models/yolo_player/ — see scripts/download_yolo_weights.py yolo26n-cls.pt
+# Keep the file under models/ — see scripts/download_yolo_weights.py yolo26n-cls.pt
 
 tracker_type: botsort
 track_high_thresh: 0.30
@@ -19,4 +19,4 @@ gmc_method: sparseOptFlow
 proximity_thresh: 0.50
 appearance_thresh: 0.25
 with_reid: True
-model: models/yolo_player/yolo26n-cls.pt
+model: models/yolo26n-cls.pt

@@ -1,4 +1,4 @@
-"""Materialize a stock YOLO checkpoint into ``models/yolo_player/``.
+"""Materialize a stock YOLO checkpoint into ``models/``.
 
 Usage::
 
@@ -16,7 +16,7 @@ from pathlib import Path
 
 def main() -> int:
     name = sys.argv[1] if len(sys.argv) > 1 else "yolo26n.pt"
-    target_dir = Path(__file__).resolve().parent.parent / "models" / "yolo_player"
+    target_dir = Path(__file__).resolve().parent.parent / "models"
     target_dir.mkdir(parents=True, exist_ok=True)
     target = target_dir / name
 

@@ -31,6 +31,62 @@ app = typer.Typer(
 )
 
 
+def _resolve_analyze_yolo(
+    yolo_weights: Optional[Path],
+    yolo_run: Optional[int],
+    config_default: str,
+) -> str:
+    from src.utils.model_runs import (
+        latest_yolo_run,
+        legacy_yolo_checkpoint,
+        resolve_yolo_run_checkpoint,
+    )
+
+    if yolo_weights is not None and yolo_run is not None:
+        raise typer.BadParameter("Use either --yolo-weights or --yolo-run, not both.")
+    if yolo_weights is not None:
+        return str(yolo_weights)
+    if yolo_run is not None:
+        return str(resolve_yolo_run_checkpoint(yolo_run))
+    if Path(config_default).is_file():
+        return config_default
+    latest = latest_yolo_run()
+    if latest is not None:
+        return str(resolve_yolo_run_checkpoint(latest))
+    legacy = legacy_yolo_checkpoint()
+    if legacy is not None:
+        return str(legacy)
+    return config_default
+
+
+def _resolve_analyze_action(
+    action_weights: Optional[Path],
+    action_run: Optional[int],
+    config_default: str,
+) -> str:
+    from src.utils.model_runs import (
+        latest_action_run,
+        legacy_action_checkpoint,
+        resolve_action_run_checkpoint,
+    )
+
+    if action_weights is not None and action_run is not None:
+        raise typer.BadParameter("Use either --action-weights or --action-run, not both.")
+    if action_weights is not None:
+        return str(action_weights)
+    if action_run is not None:
+        return str(resolve_action_run_checkpoint(action_run))
+    if Path(config_default).is_file():
+        return config_default
+    latest = latest_action_run()
+    if latest is not None:
+        return str(resolve_action_run_checkpoint(latest))
+    legacy = legacy_action_checkpoint()
+    if legacy is not None:
+        return str(legacy)
+    return config_default
+
+
 # -------------------------------------------------------------------- #
 # analyze
 # -------------------------------------------------------------------- #
@@ -42,7 +98,13 @@ def analyze(
     frame_skip: Optional[int] = typer.Option(None, "--frame-skip", help="Process every Nth frame."),
     device: Optional[str] = typer.Option(None, "--device", help="auto|cpu|cuda|mps"),
     yolo_weights: Optional[Path] = typer.Option(None, "--yolo-weights", help="Override detector weights path."),
+    yolo_run: Optional[int] = typer.Option(
+        None, "--yolo-run", min=1, help="Use models/yolo_player_<N>/yolo_player_best.pt."
+    ),
     action_weights: Optional[Path] = typer.Option(None, "--action-weights", help="Override action checkpoint path."),
+    action_run: Optional[int] = typer.Option(
+        None, "--action-run", min=1, help="Use models/action_player_<N>/action_best.pt."
+    ),
     no_hud: bool = typer.Option(False, "--no-hud", help="Disable on-screen HUD."),
     tracking_mode: Optional[str] = typer.Option(
         None,
@@ -88,10 +150,12 @@ def analyze(
         cfg.pipeline.target_fps = target_fps if target_fps > 0 else None
     if no_hud:
         cfg.pipeline.draw_hud = False
-    if yolo_weights:
-        cfg.detection.finetuned_model_path = str(yolo_weights)
-    if action_weights:
-        cfg.action.model_checkpoint = str(action_weights)
+    cfg.detection.finetuned_model_path = _resolve_analyze_yolo(
+        yolo_weights, yolo_run, cfg.detection.finetuned_model_path
+    )
+    cfg.action.model_checkpoint = _resolve_analyze_action(
+        action_weights, action_run, cfg.action.model_checkpoint
+    )
     if tracking_mode:
         # accept the user-friendly hyphenated form too
         normalized = tracking_mode.lower().replace("-", "_").strip()
@@ -123,6 +187,8 @@ def analyze(
         f"Device={resolved_device}  tracking_mode={cfg.tracking.mode}  "
         f"player1_position={cfg.assignment.player1_position}"
     )
+    logger.info(f"YOLO weights: {cfg.detection.finetuned_model_path}")
+    logger.info(f"Action checkpoint: {cfg.action.model_checkpoint}")
 
     output.parent.mkdir(parents=True, exist_ok=True)
 
@@ -430,8 +496,15 @@ def train_yolo(
 
     from ultralytics import YOLO
 
+    from src.utils.model_runs import (
+        YOLO_KIND,
+        allocate_run_dir,
+        project_relative,
+        utc_now_iso,
+        write_run_info,
+    )
     from src.utils.yolo_weights import (
-        YOLO_PLAYER_DIR,
+        MODELS_DIR,
         promote_finetuned_best,
         remove_stray_root_weight,
         resolve_yolo_weight,
@@ -440,31 +513,55 @@ def train_yolo(
 
     base_spec = base_model or cfg.train_yolo.base_model
     base_path = resolve_yolo_weight(base_spec)
-    save_dir = (Path(cfg.train_yolo.project) / cfg.train_yolo.name).resolve()
+    save_dir, run = allocate_run_dir(YOLO_KIND)
+    # Resolve before ultralytics_weights_cwd chdirs into models/.
+    data_path = data.resolve()
+    save_dir = save_dir.resolve()
+    n_epochs = epochs or cfg.train_yolo.epochs
+    n_imgsz = imgsz or cfg.train_yolo.imgsz
+    n_batch = batch or cfg.train_yolo.batch
     logger = get_logger("train_yolo")
-    logger.info(f"Training YOLO from base '{base_path}' on {data}")
+    logger.info(f"Training YOLO run {run} from base '{base_path}' on {data_path}")
     logger.info(f"Saving run artifacts to {save_dir}")
 
     load_target = str(base_path) if base_path.is_file() else base_spec
-    with ultralytics_weights_cwd(YOLO_PLAYER_DIR.resolve()):
+    with ultralytics_weights_cwd(MODELS_DIR.resolve()):
         model = YOLO(load_target)
         remove_stray_root_weight(Path(load_target).name, keep=base_path if base_path.is_file() else None)
         results = model.train(
-            data=str(data),
-            epochs=epochs or cfg.train_yolo.epochs,
-            imgsz=imgsz or cfg.train_yolo.imgsz,
-            batch=batch or cfg.train_yolo.batch,
+            data=str(data_path),
+            epochs=n_epochs,
+            imgsz=n_imgsz,
+            batch=n_batch,
             device=resolved_device,
             save_dir=str(save_dir),
             exist_ok=True,
         )
-    remove_stray_root_weight("yolo26n.pt", keep=YOLO_PLAYER_DIR / "yolo26n.pt")
+    remove_stray_root_weight("yolo26n.pt", keep=MODELS_DIR / "yolo26n.pt")
+    remove_stray_root_weight("yolo26n-cls.pt", keep=MODELS_DIR / "yolo26n-cls.pt")
 
     best_src = save_dir / "weights" / "best.pt"
     promoted = promote_finetuned_best(save_dir)
     if promoted:
         logger.info(f"Fine-tuned detector for analyze: {promoted}")
-    logger.info(f"YOLO training complete. Run weights: {best_src}")
+    write_run_info(
+        save_dir,
+        {
+            "run": run,
+            "kind": YOLO_KIND,
+            "created_at": utc_now_iso(),
+            "epochs": n_epochs,
+            "imgsz": n_imgsz,
+            "batch": n_batch,
+            "data": project_relative(data_path),
+            "base_model": project_relative(base_path),
+            "checkpoint": project_relative(promoted or best_src),
+        },
+    )
+    logger.info(
+        f"YOLO training complete (run {run}). "
+        f"Analyze with: --yolo-run {run}"
+    )
 
 
 # -------------------------------------------------------------------- #
@@ -496,14 +593,46 @@ def train_action_cmd(
     resolved_device = resolve_device(cfg.device)
 
     from src.action.train import train as run_train
+    from src.utils.model_runs import (
+        ACTION_KIND,
+        allocate_run_dir,
+        project_relative,
+        utc_now_iso,
+        write_run_info,
+    )
 
-    run_train(
+    run_dir, run = allocate_run_dir(ACTION_KIND)
+    cfg.train_action.output_dir = str(run_dir)
+    logger = get_logger("train_action")
+    logger.info(f"Training action run {run} -> {run_dir}")
+
+    result = run_train(
         manifest=manifest,
         action_cfg=cfg.action,
         train_cfg=cfg.train_action,
         device=resolved_device,
         seed=cfg.seed,
         pretrained_imagenet=not no_pretrained,
+    )
+    write_run_info(
+        run_dir,
+        {
+            "run": run,
+            "kind": ACTION_KIND,
+            "created_at": utc_now_iso(),
+            "epochs": cfg.train_action.epochs,
+            "batch_size": cfg.train_action.batch_size,
+            "manifest": project_relative(manifest),
+            "best_val_f1": result.best_val_f1,
+            "best_val_acc": result.best_val_acc,
+            "test_f1": result.test_f1,
+            "test_acc": result.test_acc,
+            "checkpoint": project_relative(result.checkpoint_path),
+        },
+    )
+    logger.info(
+        f"Action training complete (run {run}). "
+        f"Analyze with: --action-run {run}"
     )
 
 
@@ -512,15 +641,21 @@ def train_action_cmd(
 # -------------------------------------------------------------------- #
 @app.command("plot-training")
 def plot_training_cmd(
-    history: Path = typer.Option(
-        Path("models/action_player/train_history.json"),
+    action_run: Optional[int] = typer.Option(
+        None,
+        "--action-run",
+        min=1,
+        help="Use models/action_player_<N>/ (overrides default --history/--out).",
+    ),
+    history: Optional[Path] = typer.Option(
+        None,
         "--history",
         exists=True,
         dir_okay=False,
         help="train_history.json from train-action.",
     ),
-    out: Path = typer.Option(
-        Path("models/action_player"),
+    out: Optional[Path] = typer.Option(
+        None,
         "--out",
         help="Directory for PNG output (defaults to the history file's parent).",
     ),
@@ -535,6 +670,15 @@ def plot_training_cmd(
     """Regenerate training curve PNGs from train_history.json."""
     setup_logging("INFO")
     from src.action.plots import save_training_plots_from_files
+    from src.utils.model_runs import MODELS_DIR, ACTION_KIND
+
+    if action_run is not None:
+        run_dir = MODELS_DIR / f"{ACTION_KIND}_{action_run}"
+        history = history or (run_dir / "train_history.json")
+        out = out or run_dir
+    else:
+        history = history or Path("models/action_player/train_history.json")
+        out = out or history.parent
 
     paths = save_training_plots_from_files(
         history_path=history,
@@ -566,13 +710,27 @@ def info(
     typer.echo(f"mps_available: {mps_available()}")
     typer.echo(f"resolved device: {resolve_device(cfg.device)}")
 
+    from src.utils.model_runs import (
+        ACTION_KIND,
+        YOLO_KIND,
+        existing_run_numbers,
+        latest_action_run,
+        latest_yolo_run,
+    )
+
     typer.echo("\n=== Detection ===")
     typer.echo(f"  finetuned: {cfg.detection.finetuned_model_path} (exists={Path(cfg.detection.finetuned_model_path).exists()})")
     typer.echo(f"  stock:     {cfg.detection.model_path} (exists={Path(cfg.detection.model_path).exists()})")
+    latest_yolo = latest_yolo_run()
+    n_yolo = len(existing_run_numbers(YOLO_KIND))
+    typer.echo(f"  latest yolo run: {latest_yolo if latest_yolo is not None else '—'}  ({n_yolo} total)")
 
     typer.echo("\n=== Action ===")
     typer.echo(f"  checkpoint: {cfg.action.model_checkpoint} (exists={Path(cfg.action.model_checkpoint).exists()})")
     typer.echo(f"  clip_length={cfg.action.clip_length}  input_size={cfg.action.input_size}")
+    latest_action = latest_action_run()
+    n_action = len(existing_run_numbers(ACTION_KIND))
+    typer.echo(f"  latest action run: {latest_action if latest_action is not None else '—'}  ({n_action} total)")
 
     from src.tracking.tracker import resolve_tracker_yaml
 

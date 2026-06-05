@@ -30,7 +30,7 @@ class PipelineConfig:
 
 @dataclass
 class DetectionConfig:
-    model_path: str = "models/yolo_player/yolo26n.pt"
+    model_path: str = "models/yolo26n.pt"
     finetuned_model_path: str = "models/yolo_player/yolo_player_best.pt"
     conf_threshold: float = 0.35
     iou_threshold: float = 0.5
@@ -114,7 +114,7 @@ class TrainActionConfig:
 
 @dataclass
 class TrainYoloConfig:
-    base_model: str = "models/yolo_player/yolo26n.pt"
+    base_model: str = "models/yolo26n.pt"
     epochs: int = 50
     imgsz: int = 640
     batch: int = 16

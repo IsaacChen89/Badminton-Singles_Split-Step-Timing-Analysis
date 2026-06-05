@@ -18,8 +18,8 @@ pipeline:
 
 # Detection (YOLO)
 detection:
-  model_path: models/yolo_player/yolo26n.pt  # stock base weights; ultralytics cache if missing
-  finetuned_model_path: models/yolo_player/yolo_player_best.pt  # promoted after train-yolo
+  model_path: models/yolo26n.pt  # stock base weights; ultralytics cache if missing
+  finetuned_model_path: models/yolo_player/yolo_player_best.pt  # legacy; prefer --yolo-run N
   conf_threshold: 0.35
   iou_threshold: 0.5      # kept for API compat; YOLO26 is NMS-free at inference
   imgsz: 640
@@ -55,7 +55,7 @@ assignment:
 
 # Action recognition (CNN-LSTM)
 action:
-  model_checkpoint: models/action_player/action_best.pt  # may not exist on first run
+  model_checkpoint: models/action_player/action_best.pt  # legacy; prefer --action-run N
   clip_length: 16          # T frames per clip
   clip_stride: 1
   input_size: 224
@@ -75,7 +75,7 @@ smoothing:
   cooldown_frames: 6       # minimum sustained low-prob frames to clear it
 
 # Training (action model)
-# All artifacts go under models/action_player/ (history, plots, checkpoints).
+# Each train-action run writes to models/action_player_<N>/ (auto-incremented).
 train_action:
   epochs: 30
   batch_size: 16
@@ -85,13 +85,13 @@ train_action:
   val_split: 0.2
   class_weight_balance: true
   amp: true                # mixed precision when CUDA available
-  output_dir: models/action_player
+  output_dir: models/action_player  # overridden per run by train-action
 
 # Training (YOLO detector via ultralytics)
-# Stock base: models/yolo_player/yolo26n.pt
-# Outputs: models/yolo_player/weights/best.pt (+ auto-copy to yolo_player_best.pt)
+# Stock base: models/yolo26n.pt
+# Each train-yolo run writes to models/yolo_player_<N>/ (auto-incremented).
 train_yolo:
-  base_model: models/yolo_player/yolo26n.pt
+  base_model: models/yolo26n.pt
   epochs: 50
   imgsz: 640
   batch: 16
