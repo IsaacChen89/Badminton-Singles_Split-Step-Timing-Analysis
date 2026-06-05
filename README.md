@@ -91,8 +91,8 @@ auto` picks **MPS** (Metal GPU) when available. The CLI auto-detects the best ba
 To pre-download the stock YOLO checkpoint into `./models/`:
 
 ```bash
-python scripts/download_yolo_weights.py            # -> models/yolo_player/yolo26n.pt
-python scripts/download_yolo_weights.py yolo26n-cls.pt  # BoT-SORT Re-ID (strong tracking)
+python scripts/download_yolo_weights.py            # -> models/yolo26n.pt
+python scripts/download_yolo_weights.py yolo26n-cls.pt  # -> models/yolo26n-cls.pt (BoT-SORT Re-ID)
 ```
 
 Verify your environment:
@@ -113,27 +113,20 @@ python main.py analyze \
   --output outputs/match_annotated.mp4
 ```
 
+Analyze with a specific run:
+
+```bash
+python main.py analyze \
+  --video  data/raw/match.mp4 \
+  --output outputs/match_annotated.mp4 \
+  --yolo-run 1 \
+  --action-run 1
+```
+
 - Input videos at any frame rate (25, 30, 60 FPS, …) are automatically resampled to **30 FPS** before being fed to the pipeline so the action model sees the same temporal cadence it was trained on. 
 - The annotated output MP4 is written at the same target rate. 
 - Override with `--target-fps <N>` or `pipeline.target_fps` in `config.yaml`; pass `--target-fps 0` (or set the config to `null`) to disable resampling and keep the source FPS.
-
-Useful options:
-
-
-| Flag                                                | Effect                                                                                             |
-| --------------------------------------------------- | -------------------------------------------------------------------------------------------------- |
-| `--debug-ids`                                       | Show raw tracker IDs next to each player box (useful when diagnosing ID swaps).                    |
-| `--min-confidence 0.3`                              | Drop detections below this YOLO confidence.                                                        |
-| `--frame-skip 2`                                    | Run detection/tracking only on every 2nd frame (≈2× faster).                                       |
-| `--target-fps 30`                                   | Resample the input video to this FPS before processing (default 30, pass 0 to disable).            |
-| `--device cpu` / `--device cuda` / `--device mps` | Force device (default `auto`: cuda → mps → cpu). |
-| `--yolo-weights models/yolo_player/yolo_player_best.pt` | Use a fine-tuned YOLO checkpoint.                                                              |
-| `--action-weights models/action_player/action_best.pt` | Use a specific action checkpoint.                                                               |
-| `--no-hud`                                          | Hide the corner HUD.                                                                               |
-| `--max-frames 600`                                  | Stop after 600 frames (debugging).                                                                 |
-
-
-> If `models/action_player/action_best.pt` does not yet exist (you haven't trained the split-step model), `analyze` still runs and writes the bounding boxes — the `SPLIT STEP` label simply never fires. Train the action model and re-run.
+- Use `--yolo-run N` and `--action-run N` to pick versioned checkpoints, or pass explicit `--yolo-weights` / `--action-weights` paths. If no action checkpoint is found, `analyze` still writes bounding boxes — the `SPLIT STEP` label simply never fires.
 
 ---
 
@@ -168,8 +161,8 @@ Set `--player1-position` or `assignment.player1_position` to match your camera:
 - Start with **`--tracking-mode strong`** (default).
 - Match **`player1_position`** to your camera (end-on → `top`; side-on → `left`/`right`).
 - Use **`--debug-ids`** once; churning IDs → raise **`--min-confidence`** or fine-tune YOLO.
-- Fine-tuned **`models/yolo_player/yolo_player_best.pt`** reduces ID swaps more than tracker tweaks alone.
-- **`strong`** mode uses `models/yolo_player/yolo26n-cls.pt` for Re-ID (not the repo root).
+- Fine-tuned YOLO (e.g. **`--yolo-run 1`**) reduces ID swaps more than tracker tweaks alone.
+- **`strong`** mode uses `models/yolo26n-cls.pt` for Re-ID (not the repo root).
 
 All tuning knobs are under `tracking:` and `assignment:` in `config.yaml`.
 
@@ -358,13 +351,13 @@ After running `convert-cvat --mode yolo` (or `--mode both`):
 ```bash
 python main.py train-yolo \
   --data data/yolo/data.yaml \
-  --base-model models/yolo_player/yolo26n.pt \
+  --base-model models/yolo26n.pt \
   --epochs 50 \
   --imgsz 640 \
   --batch 16
 ```
 
-Training writes run artifacts under `models/yolo_player/` (`weights/best.pt`, `results.csv`, plots, …). When training finishes, **`train-yolo` automatically copies** `weights/best.pt` → `models/yolo_player/yolo_player_best.pt` for `analyze`.
+Each run is saved under an auto-incremented folder: `models/yolo_player_1/`, `models/yolo_player_2/`, … (`weights/best.pt`, `yolo_player_best.pt`, `results.csv`, plots, `run_info.json`). Gaps are preserved (if `_1` and `_3` exist, the next run is `_4`).
 
 ---
 
@@ -383,16 +376,15 @@ Highlights:
 - Class-weighted cross-entropy (badminton split steps are heavily
 imbalanced — most frames are "normal").
 - Cosine LR schedule, AdamW, AMP when CUDA is available.
-- Best checkpoint by macro-F1 (on val) saved to
-  `models/action_player/action_best.pt`.
-- Per-epoch metrics dumped to `models/action_player/train_history.json`.
-- **Training plots** saved to `models/action_player/training_curves.png` and
-  (when a test split exists) `models/action_player/test_class_metrics.png`.
-  Re-generate anytime with `python main.py plot-training`.
+- Each run saved under `models/action_player_1/`, `models/action_player_2/`, …
+- Best checkpoint by macro-F1 (on val) saved to `action_best.pt` inside that run folder.
+- Per-epoch metrics in `train_history.json`; metadata in `run_info.json`.
+- **Training plots** in `training_curves.png` and (when a test split exists) `test_class_metrics.png`.
+  Re-generate with `python main.py plot-training --action-run 1`.
 - **End-of-training test eval** — when the manifest contains a `test`
 split, the best (by val F1) checkpoint is reloaded and scored on the
 held-out test clips. Loss, accuracy, macro-F1, and a per-class
-precision/recall report are persisted to `models/action_player/test_metrics.json`.
+precision/recall report are persisted to `test_metrics.json` in the run folder.
 
 `config.yaml` exposes every relevant knob (clip length, backbone, LSTM size, augmentations, etc.).
 
