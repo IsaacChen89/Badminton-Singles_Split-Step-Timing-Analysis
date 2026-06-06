@@ -199,7 +199,7 @@ def train(
     )
 
     use_amp = bool(train_cfg.amp and device_supports_amp(device))
-    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+    scaler = torch.amp.GradScaler("cuda") if use_amp else None
     logger.info(f"Training on device={device}  amp={use_amp}")
 
     out_dir = Path(train_cfg.output_dir)
@@ -220,14 +220,17 @@ def train(
             clips = clips.to(device, non_blocking=True)
             labels = labels.to(device, non_blocking=True)
             optimizer.zero_grad(set_to_none=True)
-            with torch.cuda.amp.autocast(enabled=use_amp):
-                logits = model(clips)
-                loss = criterion(logits, labels)
             if use_amp:
+                assert scaler is not None
+                with torch.amp.autocast("cuda"):
+                    logits = model(clips)
+                    loss = criterion(logits, labels)
                 scaler.scale(loss).backward()
                 scaler.step(optimizer)
                 scaler.update()
             else:
+                logits = model(clips)
+                loss = criterion(logits, labels)
                 loss.backward()
                 optimizer.step()
             scheduler.step()
