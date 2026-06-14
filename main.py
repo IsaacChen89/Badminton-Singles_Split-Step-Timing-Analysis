@@ -622,6 +622,8 @@ def train_action_cmd(
             "created_at": utc_now_iso(),
             "epochs": cfg.train_action.epochs,
             "batch_size": cfg.train_action.batch_size,
+            "lr": cfg.train_action.lr,
+            "weight_decay": cfg.train_action.weight_decay,
             "manifest": project_relative(manifest),
             "best_val_f1": result.best_val_f1,
             "best_val_acc": result.best_val_acc,
