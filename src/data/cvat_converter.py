@@ -457,15 +457,16 @@ def discover_jobs(
 # YOLO detection export
 # -------------------------------------------------------------------- #
 def _split_train_val_test(
-    items: Sequence[int],
+    items: Sequence[str | int],
     val_split: float,
     test_split: float,
     seed: int = 42,
 ) -> Tuple[set, set, set]:
-    """Three-way deterministic split.
+    """Three-way deterministic random split over ``items``.
 
     The train share is implicit (``1 - val_split - test_split``). Both splits
-    must be non-negative and sum to strictly less than 1.
+    must be non-negative and sum to strictly less than 1. Items are shuffled
+    with ``seed`` before partitioning.
     """
     if val_split < 0 or test_split < 0:
         raise ValueError(
@@ -492,6 +493,35 @@ def _split_train_val_test(
     return train, val, test
 
 
+def _assign_group_splits(
+    groups: Sequence[str],
+    val_split: float,
+    test_split: float,
+    seed: int = 42,
+) -> Dict[str, str]:
+    """Assign each group (e.g. video stem) entirely to ``train``, ``val``, or ``test``."""
+    unique = sorted(set(groups))
+    train, val, test = _split_train_val_test(unique, val_split, test_split, seed=seed)
+    mapping: Dict[str, str] = {}
+    for stem in train:
+        mapping[stem] = "train"
+    for stem in val:
+        mapping[stem] = "val"
+    for stem in test:
+        mapping[stem] = "test"
+    return mapping
+
+
+def _log_group_split(group_splits: Dict[str, str], seed: int) -> None:
+    n_train = sum(1 for s in group_splits.values() if s == "train")
+    n_val = sum(1 for s in group_splits.values() if s == "val")
+    n_test = sum(1 for s in group_splits.values() if s == "test")
+    logger.info(
+        f"Group split over {len(group_splits)} video(s): "
+        f"train={n_train}, val={n_val}, test={n_test} (seed={seed})"
+    )
+
+
 def _coerce_jobs(
     jobs: "CvatJob | Iterable[CvatJob]",
 ) -> List[CvatJob]:
@@ -508,6 +538,7 @@ def export_yolo_detection(
     every_n_frames: int = 1,
     yolo_class_name: str = "player",
     seed: int = 42,
+    group_split: bool = True,
 ) -> Path:
     """Export a YOLO-detection-ready dataset from one or more CVAT jobs.
 
@@ -517,9 +548,9 @@ def export_yolo_detection(
 
     Labeled frames are split three ways (``train`` / ``val`` / ``test``) and
     routed to ``images/<split>`` + ``labels/<split>``. The train share is
-    implicit (``1 - val_split - test_split``). Ultralytics recognises the
-    ``test:`` key in ``data.yaml`` for a held-out test split
-    out of the box.
+    implicit (``1 - val_split - test_split``). When ``group_split`` is true
+    (default), whole videos are assigned to one split via a seeded shuffle.
+    Otherwise each video's frames are split independently at random.
 
     Returns the path to the written ``data.yaml``.
     """
@@ -542,6 +573,13 @@ def export_yolo_detection(
         img_dir.mkdir(parents=True, exist_ok=True)
         lbl_dir.mkdir(parents=True, exist_ok=True)
 
+    group_splits: Dict[str, str] = {}
+    if group_split:
+        group_splits = _assign_group_splits(
+            [job.stem for job in job_list], val_split, test_split, seed=seed
+        )
+        _log_group_split(group_splits, seed)
+
     total_written = 0
     for ji, job in enumerate(job_list):
         annotations = job.annotations
@@ -554,14 +592,20 @@ def export_yolo_detection(
             continue
 
         sampled = [f for f in frames_with_any_box if (f % max(1, every_n_frames)) == 0]
-        # Per-job seed so repeated runs are reproducible regardless of order.
-        train_set, val_set, test_set = _split_train_val_test(
-            sampled, val_split, test_split, seed=seed + ji
-        )
-        logger.info(
-            f"[{stem}] YOLO: {len(sampled)} frames "
-            f"(train={len(train_set)}, val={len(val_set)}, test={len(test_set)})"
-        )
+        if group_split:
+            video_split = group_splits[stem]
+            logger.info(
+                f"[{stem}] YOLO: {len(sampled)} frames -> split={video_split}"
+            )
+        else:
+            # Per-job seed so repeated runs are reproducible regardless of order.
+            train_set, val_set, test_set = _split_train_val_test(
+                sampled, val_split, test_split, seed=seed + ji
+            )
+            logger.info(
+                f"[{stem}] YOLO: {len(sampled)} frames "
+                f"(train={len(train_set)}, val={len(val_set)}, test={len(test_set)})"
+            )
 
         sampled_set = set(sampled)
         n_written = 0
@@ -571,7 +615,9 @@ def export_yolo_detection(
             for frame_idx, frame in reader.iter_frames():
                 if frame_idx not in sampled_set:
                     continue
-                if frame_idx in val_set:
+                if group_split:
+                    split = video_split
+                elif frame_idx in val_set:
                     split = "val"
                 elif frame_idx in test_set:
                     split = "test"
@@ -640,6 +686,7 @@ def export_action_dataset(
     pad_ratio: float = 0.15,
     crop_size: int = 224,
     seed: int = 42,
+    group_split: bool = True,
 ) -> Path:
     """Export per-player crop clips for the action model.
 
@@ -649,7 +696,10 @@ def export_action_dataset(
 
     Clips are split three ways into ``train`` / ``val`` / ``test`` (the train
     share is implicit: ``1 - val_split - test_split``) and the chosen split
-    is recorded in the ``split`` column of the manifest.
+    is recorded in the ``split`` column of the manifest. When ``group_split``
+    is true (default), all clips from a video share one split via a seeded
+    shuffle over video stems. Otherwise clips are split independently at
+    random within each video.
 
     Writes one global ``manifest.csv`` covering all jobs.
     """
@@ -665,6 +715,13 @@ def export_action_dataset(
     total_clips = 0
     total_frames = 0
     total_skipped = 0
+
+    group_splits: Dict[str, str] = {}
+    if group_split:
+        group_splits = _assign_group_splits(
+            [job.stem for job in job_list], val_split, test_split, seed=seed
+        )
+        _log_group_split(group_splits, seed)
 
     for ji, job in enumerate(job_list):
         annotations = job.annotations
@@ -704,11 +761,12 @@ def export_action_dataset(
                 continue
             track_boxes[pid] = tr.by_frame()
 
-        # Three-way split over clip indices. Use the shared helper so the
-        # behavior matches YOLO export exactly (same shuffle, same rounding).
-        train_indices, val_indices, test_indices = _split_train_val_test(
-            range(len(targets)), val_split, test_split, seed=seed + ji
-        )
+        if group_split:
+            video_split = group_splits[stem]
+        else:
+            train_indices, val_indices, test_indices = _split_train_val_test(
+                range(len(targets)), val_split, test_split, seed=seed + ji
+            )
 
         # Map each needed source frame -> [(clip_idx, position_in_clip), ...]
         needed: Dict[int, List[Tuple[int, int]]] = {}
@@ -725,7 +783,9 @@ def export_action_dataset(
             cdir = clips_dir / clip_id
             cdir.mkdir(parents=True, exist_ok=True)
             clip_dirs.append(cdir)
-            if clip_idx in val_indices:
+            if group_split:
+                split = video_split
+            elif clip_idx in val_indices:
                 split = "val"
             elif clip_idx in test_indices:
                 split = "test"
@@ -773,12 +833,18 @@ def export_action_dataset(
                     n_frames_written += 1
         total_frames += n_frames_written
         total_skipped += n_skipped
-        logger.info(
-            f"[{stem}] action: {len(targets)} clips "
-            f"(train={len(train_indices)}, val={len(val_indices)}, "
-            f"test={len(test_indices)}), "
-            f"{n_frames_written} frames written, {n_skipped} skipped."
-        )
+        if group_split:
+            logger.info(
+                f"[{stem}] action: {len(targets)} clips -> split={video_split}, "
+                f"{n_frames_written} frames written, {n_skipped} skipped."
+            )
+        else:
+            logger.info(
+                f"[{stem}] action: {len(targets)} clips "
+                f"(train={len(train_indices)}, val={len(val_indices)}, "
+                f"test={len(test_indices)}), "
+                f"{n_frames_written} frames written, {n_skipped} skipped."
+            )
 
     manifest_path = output_dir / "manifest.csv"
     with manifest_path.open("w", encoding="utf-8", newline="") as f:
@@ -831,6 +897,7 @@ def convert_cvat(
     player2_label: str = "player2",
     split_attribute: str = "split_step",
     seed: int = 42,
+    group_split: bool = True,
 ) -> Dict[str, Path]:
     """Run YOLO + action exports in one shot.
 
@@ -854,6 +921,7 @@ def convert_cvat(
             every_n_frames=every_n_frames,
             yolo_class_name=yolo_class_name,
             seed=seed,
+            group_split=group_split,
         )
     if do_action:
         out["action"] = export_action_dataset(
@@ -869,6 +937,7 @@ def convert_cvat(
             pad_ratio=pad_ratio,
             crop_size=crop_size,
             seed=seed,
+            group_split=group_split,
         )
     return out
 
@@ -910,6 +979,11 @@ def _cli() -> None:
         val_split: float = typer.Option(0.2, "--val-split"),
         test_split: float = typer.Option(0.2, "--test-split"),
         every_n: int = typer.Option(1, "--every-n"),
+        no_group_split: bool = typer.Option(
+            False,
+            "--no-group-split",
+            help="Split randomly within each video instead of by whole video.",
+        ),
     ) -> None:
         """Auto-pair videos in --raw-dir with CVAT files in --cvat-dir."""
         auto_convert(
@@ -921,6 +995,7 @@ def _cli() -> None:
             val_split=val_split,
             test_split=test_split,
             every_n_frames=every_n,
+            group_split=not no_group_split,
         )
 
     @app.command("single")
@@ -938,6 +1013,11 @@ def _cli() -> None:
         val_split: float = typer.Option(0.2, "--val-split"),
         test_split: float = typer.Option(0.2, "--test-split"),
         every_n: int = typer.Option(1, "--every-n"),
+        no_group_split: bool = typer.Option(
+            False,
+            "--no-group-split",
+            help="Split randomly within each video instead of by whole video.",
+        ),
         only: str = typer.Option(
             "both", "--only", help="yolo | action | both"
         ),
@@ -956,6 +1036,7 @@ def _cli() -> None:
             val_split=val_split,
             test_split=test_split,
             every_n_frames=every_n,
+            group_split=not no_group_split,
         )
 
     app()

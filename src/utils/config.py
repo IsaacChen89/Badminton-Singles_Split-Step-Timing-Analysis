@@ -132,6 +132,7 @@ class CvatConfig:
     val_split: float = 0.2
     test_split: float = 0.2
     every_n_frames: int = 1
+    group_split: bool = True
 
 
 @dataclass

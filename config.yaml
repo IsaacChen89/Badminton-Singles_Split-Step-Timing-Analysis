@@ -111,3 +111,4 @@ cvat:
   val_split: 0.2
   test_split: 0.2
   every_n_frames: 1        # subsample frames when exporting YOLO images
+  group_split: true        # assign whole videos to train/val/test (seeded shuffle)

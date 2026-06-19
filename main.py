@@ -395,6 +395,11 @@ def convert_cvat(
         help="Held-out test fraction (train share is implicit: 1 - val - test).",
     ),
     every_n: Optional[int] = typer.Option(None, "--every-n", help="YOLO: subsample every Nth labeled frame."),
+    no_group_split: bool = typer.Option(
+        False,
+        "--no-group-split",
+        help="Split clips/frames randomly within each video instead of by whole video.",
+    ),
 ) -> None:
     """Convert CVAT for Video 1.1 exports into YOLO and/or action datasets.
 
@@ -471,6 +476,7 @@ def convert_cvat(
         player2_label=cfg.cvat.player2_label,
         split_attribute=cfg.cvat.split_attribute,
         seed=cfg.seed,
+        group_split=cfg.cvat.group_split and not no_group_split,
     )
 
 
