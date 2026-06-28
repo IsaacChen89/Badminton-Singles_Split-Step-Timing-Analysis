@@ -148,6 +148,7 @@ def build_model(cfg: ActionConfig) -> SplitStepCNNLSTM:
         lstm_hidden=cfg.lstm_hidden,
         lstm_layers=cfg.lstm_layers,
         bidirectional=cfg.bidirectional,
+        dropout=cfg.dropout,
         freeze_backbone=cfg.freeze_backbone,
     )
 

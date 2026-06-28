@@ -633,9 +633,13 @@ def train_action_cmd(
             "manifest": project_relative(manifest),
             "best_val_f1": result.best_val_f1,
             "best_val_acc": result.best_val_acc,
+            "best_epoch": result.best_epoch,
+            "best_metric": result.best_metric,
+            "best_metric_value": result.best_metric_value,
             "test_f1": result.test_f1,
             "test_acc": result.test_acc,
             "checkpoint": project_relative(result.checkpoint_path),
+            "split_summary": project_relative(run_dir / "split_summary.json"),
         },
     )
     logger.info(

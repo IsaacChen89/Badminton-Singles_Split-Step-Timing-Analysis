@@ -88,6 +88,7 @@ class ActionConfig:
     lstm_hidden: int = 128
     lstm_layers: int = 1
     bidirectional: bool = True
+    dropout: float = 0.2
 
 
 @dataclass
@@ -108,6 +109,9 @@ class TrainActionConfig:
     num_workers: int = 2
     val_split: float = 0.2
     class_weight_balance: bool = True
+    label_smoothing: float = 0.0
+    early_stopping_patience: int = 0
+    best_metric: str = "macro_f1"
     amp: bool = True
     output_dir: str = "models/action_player"
 

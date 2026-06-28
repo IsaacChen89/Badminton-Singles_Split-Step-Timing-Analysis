@@ -21,6 +21,7 @@ from .dataset import (
     build_eval_transform,
     build_train_transform,
 )
+from .manifest import summarize_manifest
 from .model import build_model, load_checkpoint, save_checkpoint
 from .plots import save_training_plots
 
@@ -33,6 +34,9 @@ class TrainResult:
     best_val_acc: float
     checkpoint_path: str
     history: list[dict]
+    best_epoch: Optional[int] = None
+    best_metric: str = "macro_f1"
+    best_metric_value: Optional[float] = None
     test_acc: Optional[float] = None
     test_f1: Optional[float] = None
     test_loss: Optional[float] = None
@@ -106,6 +110,27 @@ def _class_weights(labels: np.ndarray, num_classes: int) -> torch.Tensor:
     counts = np.where(counts == 0, 1.0, counts)
     weights = counts.sum() / (num_classes * counts)
     return torch.tensor(weights, dtype=torch.float32)
+
+
+def _class_report_metric(report: dict, class_id: str, metric: str) -> float:
+    value = report.get(class_id, {}).get(metric, float("nan"))
+    return float(value) if value is not None else float("nan")
+
+
+def _select_metric(metrics: EvalMetrics, best_metric: str) -> float:
+    normalized = best_metric.strip().lower()
+    if normalized in {"macro_f1", "val_f1", "f1"}:
+        return metrics.f1
+    if normalized in {"acc", "accuracy", "val_acc"}:
+        return metrics.acc
+    if normalized in {"split_step_f1", "class1_f1"}:
+        return _class_report_metric(metrics.report, "1", "f1-score")
+    if normalized in {"split_step_recall", "class1_recall"}:
+        return _class_report_metric(metrics.report, "1", "recall")
+    raise ValueError(
+        "Unsupported train_action.best_metric "
+        f"'{best_metric}'. Use macro_f1, accuracy, split_step_f1, or split_step_recall."
+    )
 
 
 def train(
@@ -182,12 +207,15 @@ def train(
     if pretrained_imagenet:
         model.try_load_imagenet_weights()
 
+    label_smoothing = max(0.0, min(1.0, float(train_cfg.label_smoothing)))
     if train_cfg.class_weight_balance:
         weights = _class_weights(train_ds.labels, action_cfg.num_classes).to(device)
-        criterion = nn.CrossEntropyLoss(weight=weights)
+        criterion = nn.CrossEntropyLoss(weight=weights, label_smoothing=label_smoothing)
         logger.info(f"Class weights: {weights.tolist()}")
     else:
-        criterion = nn.CrossEntropyLoss()
+        criterion = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
+    if label_smoothing > 0:
+        logger.info(f"Label smoothing: {label_smoothing:.3f}")
 
     trainable = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(
@@ -206,10 +234,18 @@ def train(
     out_dir.mkdir(parents=True, exist_ok=True)
     best_path = out_dir / "action_best.pt"
     last_path = out_dir / "action_last.pt"
+    split_summary = summarize_manifest(manifest)
+    (out_dir / "split_summary.json").write_text(json.dumps(split_summary, indent=2))
+    for warning in split_summary.get("warnings", []):
+        logger.warning(f"Manifest warning: {warning}")
 
     history: list[dict] = []
+    best_metric_name = train_cfg.best_metric.strip().lower()
+    best_score = -math.inf
     best_f1 = -math.inf
     best_acc = 0.0
+    best_epoch: Optional[int] = None
+    epochs_without_improvement = 0
 
     for epoch in range(1, train_cfg.epochs + 1):
         model.train()
@@ -245,11 +281,21 @@ def train(
         val_loss = float("nan")
         val_acc = float("nan")
         val_f1 = float("nan")
+        val_split_precision = float("nan")
+        val_split_recall = float("nan")
+        val_split_f1 = float("nan")
+        val_split_support = 0.0
+        val_score = float("nan")
         if val_loader is not None:
             val_metrics = evaluate_model(model, val_loader, criterion, device)
             val_loss = val_metrics.loss
             val_acc = val_metrics.acc
             val_f1 = val_metrics.f1
+            val_split_precision = _class_report_metric(val_metrics.report, "1", "precision")
+            val_split_recall = _class_report_metric(val_metrics.report, "1", "recall")
+            val_split_f1 = _class_report_metric(val_metrics.report, "1", "f1-score")
+            val_split_support = _class_report_metric(val_metrics.report, "1", "support")
+            val_score = _select_metric(val_metrics, best_metric_name)
 
         epoch_log = {
             "epoch": epoch,
@@ -258,29 +304,65 @@ def train(
             "val_loss": val_loss,
             "val_acc": val_acc,
             "val_f1": val_f1,
+            "val_split_step_precision": val_split_precision,
+            "val_split_step_recall": val_split_recall,
+            "val_split_step_f1": val_split_f1,
+            "val_split_step_support": val_split_support,
+            "val_best_metric": best_metric_name,
+            "val_best_metric_value": val_score,
             "lr": optimizer.param_groups[0]["lr"],
         }
         history.append(epoch_log)
         logger.info(
             f"epoch {epoch:03d} | train_loss {train_loss:.4f} acc {train_acc:.3f} "
-            f"| val_loss {val_loss:.4f} acc {val_acc:.3f} f1 {val_f1:.3f}"
+            f"| val_loss {val_loss:.4f} acc {val_acc:.3f} f1 {val_f1:.3f} "
+            f"| split_f1 {val_split_f1:.3f} split_recall {val_split_recall:.3f}"
         )
 
         save_checkpoint(model, last_path, extra={"epoch": epoch})
-        if not math.isnan(val_f1) and val_f1 > best_f1:
+        improved = not math.isnan(val_score) and val_score > best_score
+        if improved:
+            best_score = val_score
             best_f1 = val_f1
             best_acc = val_acc
-            save_checkpoint(model, best_path, extra={"epoch": epoch, "val_f1": val_f1})
-            logger.info(f"  -> new best F1 {best_f1:.3f} saved to {best_path}")
+            best_epoch = epoch
+            save_checkpoint(
+                model,
+                best_path,
+                extra={
+                    "epoch": epoch,
+                    "val_f1": val_f1,
+                    "val_acc": val_acc,
+                    "best_metric": best_metric_name,
+                    "best_metric_value": val_score,
+                },
+            )
+            epochs_without_improvement = 0
+            logger.info(
+                f"  -> new best {best_metric_name} {best_score:.3f} saved to {best_path}"
+            )
+        elif val_loader is not None:
+            epochs_without_improvement += 1
+            patience = max(0, int(train_cfg.early_stopping_patience))
+            if patience and epochs_without_improvement >= patience:
+                logger.info(
+                    f"Early stopping after {epoch} epochs: no {best_metric_name} "
+                    f"improvement for {patience} epoch(s)."
+                )
+                break
 
-    if math.isinf(-best_f1):
+    if math.isinf(best_score):
         # No validation set — keep "last" as best.
         save_checkpoint(model, best_path, extra={"epoch": train_cfg.epochs})
         best_f1 = float("nan")
         best_acc = float("nan")
+        best_score = float("nan")
 
     (out_dir / "train_history.json").write_text(json.dumps(history, indent=2))
-    logger.info(f"Training done. Best F1: {best_f1:.3f}  | best ckpt: {best_path}")
+    logger.info(
+        f"Training done. Best {best_metric_name}: {best_score:.3f}  "
+        f"| best F1: {best_f1:.3f}  | best ckpt: {best_path}"
+    )
 
     test_acc: Optional[float] = None
     test_f1: Optional[float] = None
@@ -323,6 +405,9 @@ def train(
         best_val_acc=best_acc,
         checkpoint_path=str(best_path),
         history=history,
+        best_epoch=best_epoch,
+        best_metric=best_metric_name,
+        best_metric_value=None if math.isnan(best_score) else best_score,
         test_acc=test_acc,
         test_f1=test_f1,
         test_loss=test_loss,

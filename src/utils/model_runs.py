@@ -62,9 +62,29 @@ def project_relative(path: str | Path) -> str:
 
 
 def write_run_info(run_dir: Path, payload: dict[str, Any]) -> Path:
+    _verify_checkpoint_payload(run_dir, payload)
     path = run_dir / RUN_INFO_NAME
     path.write_text(json.dumps(payload, indent=2))
     return path
+
+
+def _verify_checkpoint_payload(run_dir: Path, payload: dict[str, Any]) -> None:
+    checkpoint = payload.get("checkpoint")
+    if not checkpoint:
+        return
+    run_root = run_dir.resolve()
+    checkpoint_path = Path(str(checkpoint))
+    if not checkpoint_path.is_absolute():
+        checkpoint_path = Path.cwd() / checkpoint_path
+    checkpoint_path = checkpoint_path.resolve()
+    if not checkpoint_path.is_file():
+        raise FileNotFoundError(f"Run checkpoint does not exist: {checkpoint_path}")
+    try:
+        checkpoint_path.relative_to(run_root)
+    except ValueError as exc:
+        raise ValueError(
+            f"Run checkpoint must live inside {run_root}, got {checkpoint_path}"
+        ) from exc
 
 
 def yolo_checkpoint_in_dir(run_dir: Path) -> Optional[Path]:

@@ -65,6 +65,7 @@ action:
   lstm_hidden: 128
   lstm_layers: 1
   bidirectional: true
+  dropout: 0.4
 
 # Smoothing of split-step label
 smoothing:
@@ -80,10 +81,13 @@ train_action:
   epochs: 30
   batch_size: 16
   lr: 0.0003
-  weight_decay: 0.0001
+  weight_decay: 0.001
   num_workers: 2
   val_split: 0.2
   class_weight_balance: true
+  label_smoothing: 0.1
+  early_stopping_patience: 8  # 0 disables; useful for group-split overfitting
+  best_metric: split_step_f1  # macro_f1 | accuracy | split_step_f1 | split_step_recall
   amp: true                # mixed precision when CUDA available
   output_dir: models/action_player  # overridden per run by train-action
 

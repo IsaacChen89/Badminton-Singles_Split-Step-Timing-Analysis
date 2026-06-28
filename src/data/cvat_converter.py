@@ -60,7 +60,6 @@ We tolerate missing/extra attributes and ``outside="1"`` (skipped) frames.
 from __future__ import annotations
 
 import csv
-import random
 import shutil
 import tempfile
 import xml.etree.ElementTree as ET
@@ -74,6 +73,11 @@ import yaml
 
 from ..utils.geometry import clip_bbox, crop_with_padding, xyxy_to_yolo
 from ..utils.logging import get_logger
+from .splitting import (
+    assign_group_splits,
+    assign_stratified_group_splits,
+    split_train_val_test,
+)
 from .video_io import VideoReader
 
 logger = get_logger("cvat")
@@ -456,62 +460,6 @@ def discover_jobs(
 # -------------------------------------------------------------------- #
 # YOLO detection export
 # -------------------------------------------------------------------- #
-def _split_train_val_test(
-    items: Sequence[str | int],
-    val_split: float,
-    test_split: float,
-    seed: int = 42,
-) -> Tuple[set, set, set]:
-    """Three-way deterministic random split over ``items``.
-
-    The train share is implicit (``1 - val_split - test_split``). Both splits
-    must be non-negative and sum to strictly less than 1. Items are shuffled
-    with ``seed`` before partitioning.
-    """
-    if val_split < 0 or test_split < 0:
-        raise ValueError(
-            f"val_split and test_split must be >= 0 "
-            f"(got val={val_split}, test={test_split})."
-        )
-    if val_split + test_split >= 1.0:
-        raise ValueError(
-            f"val_split + test_split must be < 1.0 "
-            f"(got val={val_split} + test={test_split} = {val_split + test_split})."
-        )
-    rng = random.Random(seed)
-    indices = list(items)
-    rng.shuffle(indices)
-    n = len(indices)
-    n_val = int(round(val_split * n))
-    n_test = int(round(test_split * n))
-    # Guard against rounding pushing val+test past the total.
-    if n_val + n_test > n:
-        n_test = max(0, n - n_val)
-    val = set(indices[:n_val])
-    test = set(indices[n_val : n_val + n_test])
-    train = set(indices[n_val + n_test :])
-    return train, val, test
-
-
-def _assign_group_splits(
-    groups: Sequence[str],
-    val_split: float,
-    test_split: float,
-    seed: int = 42,
-) -> Dict[str, str]:
-    """Assign each group (e.g. video stem) entirely to ``train``, ``val``, or ``test``."""
-    unique = sorted(set(groups))
-    train, val, test = _split_train_val_test(unique, val_split, test_split, seed=seed)
-    mapping: Dict[str, str] = {}
-    for stem in train:
-        mapping[stem] = "train"
-    for stem in val:
-        mapping[stem] = "val"
-    for stem in test:
-        mapping[stem] = "test"
-    return mapping
-
-
 def _log_group_split(group_splits: Dict[str, str], seed: int) -> None:
     n_train = sum(1 for s in group_splits.values() if s == "train")
     n_val = sum(1 for s in group_splits.values() if s == "val")
@@ -520,6 +468,10 @@ def _log_group_split(group_splits: Dict[str, str], seed: int) -> None:
         f"Group split over {len(group_splits)} video(s): "
         f"train={n_train}, val={n_val}, test={n_test} (seed={seed})"
     )
+    for split in ("train", "val", "test"):
+        videos = sorted(stem for stem, assigned in group_splits.items() if assigned == split)
+        if videos:
+            logger.info(f"Group split {split}: {', '.join(videos)}")
 
 
 def _coerce_jobs(
@@ -575,7 +527,7 @@ def export_yolo_detection(
 
     group_splits: Dict[str, str] = {}
     if group_split:
-        group_splits = _assign_group_splits(
+        group_splits = assign_group_splits(
             [job.stem for job in job_list], val_split, test_split, seed=seed
         )
         _log_group_split(group_splits, seed)
@@ -599,7 +551,7 @@ def export_yolo_detection(
             )
         else:
             # Per-job seed so repeated runs are reproducible regardless of order.
-            train_set, val_set, test_set = _split_train_val_test(
+            train_set, val_set, test_set = split_train_val_test(
                 sampled, val_split, test_split, seed=seed + ji
             )
             logger.info(
@@ -715,25 +667,16 @@ def export_action_dataset(
     total_clips = 0
     total_frames = 0
     total_skipped = 0
+    targets_by_stem: Dict[str, List[Tuple[int, int, int]]] = {}
+    label_counts_by_stem: Dict[str, Dict[int, int]] = {}
 
-    group_splits: Dict[str, str] = {}
-    if group_split:
-        group_splits = _assign_group_splits(
-            [job.stem for job in job_list], val_split, test_split, seed=seed
-        )
-        _log_group_split(group_splits, seed)
-
-    for ji, job in enumerate(job_list):
-        annotations = job.annotations
-        video_path = job.video_path
+    for job in job_list:
         stem = job.stem
         track_to_pid = build_track_player_map(
-            annotations.tracks, player1_label, player2_label
+            job.annotations.tracks, player1_label, player2_label
         )
-
-        # Collect per-frame targets for this video.
         targets: List[Tuple[int, int, int]] = []
-        for tr in annotations.tracks:
+        for tr in job.annotations.tracks:
             pid = track_to_pid.get(tr.track_id)
             if pid is None:
                 continue
@@ -752,6 +695,32 @@ def export_action_dataset(
             )
             continue
         targets.sort(key=lambda x: (x[1], x[0]))
+        counts = {0: 0, 1: 0}
+        for _pid, _frame, label in targets:
+            counts[label] = counts.get(label, 0) + 1
+        targets_by_stem[stem] = targets
+        label_counts_by_stem[stem] = counts
+
+    group_splits: Dict[str, str] = {}
+    if group_split:
+        group_splits = assign_stratified_group_splits(
+            label_counts_by_stem, val_split, test_split, seed=seed
+        )
+        _log_group_split(group_splits, seed)
+
+    for ji, job in enumerate(job_list):
+        annotations = job.annotations
+        video_path = job.video_path
+        stem = job.stem
+        track_to_pid = build_track_player_map(
+            annotations.tracks, player1_label, player2_label
+        )
+
+        # Targets were precomputed so group split can ignore empty videos and
+        # balance class counts across splits before clips are written.
+        targets = targets_by_stem.get(stem, [])
+        if not targets:
+            continue
         total_clips += len(targets)
 
         track_boxes: Dict[int, Dict[int, CvatBox]] = {}
@@ -764,7 +733,7 @@ def export_action_dataset(
         if group_split:
             video_split = group_splits[stem]
         else:
-            train_indices, val_indices, test_indices = _split_train_val_test(
+            train_indices, val_indices, test_indices = split_train_val_test(
                 range(len(targets)), val_split, test_split, seed=seed + ji
             )
 
