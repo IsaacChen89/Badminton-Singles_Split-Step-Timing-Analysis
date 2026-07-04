@@ -2,8 +2,9 @@
 
 The model takes a clip of shape ``(B, T, 3, H, W)`` of cropped player ROIs,
 runs a frozen-by-default ResNet18 backbone per frame, then a (Bi)LSTM over
-the time axis, and predicts a 2-class logits vector (``normal`` vs
-``split_step``) for the clip. At inference we treat the prediction as the
+the time axis, and predicts logits for the clip. Current BCE training uses a
+single split-step logit; older checkpoints may use a 2-class logits vector
+(``normal`` vs ``split_step``). At inference we treat the prediction as the
 label of the *last* frame in the rolling window.
 """
 

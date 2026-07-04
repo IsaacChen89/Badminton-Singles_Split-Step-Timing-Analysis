@@ -57,15 +57,15 @@ assignment:
 action:
   model_checkpoint: models/action_player/action_best.pt  # legacy; prefer --action-run N
   clip_length: 16          # T frames per clip
-  clip_stride: 1
+  clip_stride: 2
   input_size: 224
-  num_classes: 2
+  num_classes: 1           # 2 for cross_entropy; use 1 for BCEWithLogitsLoss
   backbone: resnet18
   freeze_backbone: true
   lstm_hidden: 128
   lstm_layers: 1
   bidirectional: true
-  dropout: 0.4
+  dropout: 0.5
 
 # Smoothing of split-step label
 smoothing:
@@ -80,14 +80,23 @@ smoothing:
 train_action:
   epochs: 30
   batch_size: 16
-  lr: 0.0003
+  lr: 0.0001
   weight_decay: 0.001
   num_workers: 2
   val_split: 0.2
-  class_weight_balance: true
-  label_smoothing: 0.1
-  early_stopping_patience: 8  # 0 disables; useful for group-split overfitting
-  best_metric: split_step_f1  # macro_f1 | accuracy | split_step_f1 | split_step_recall
+  loss: bce                # cross_entropy | bce
+  class_weight_balance: true  # true pushes recall; hurts split-step precision
+  label_smoothing: 0.05     # only used by cross_entropy
+  early_stopping_patience: 4
+  early_stopping_metric: val_loss  # stop when val loss plateaus
+  best_metric: split_step_f1       # checkpoint selection metric
+  min_lr_ratio: 0.05          # cosine floor = lr * min_lr_ratio
+  max_pos_weight: 3.0         # cap BCE positive weight when class_weight_balance
+  grad_clip_norm: 1.0
+  classification_threshold: 0.5  # fixed threshold during training; post-train val sweep below
+  threshold_sweep_min: 0.15
+  threshold_sweep_max: 0.85
+  threshold_sweep_step: 0.05
   amp: true                # mixed precision when CUDA available
   output_dir: models/action_player  # overridden per run by train-action
 

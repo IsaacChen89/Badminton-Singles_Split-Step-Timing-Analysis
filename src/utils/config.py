@@ -108,10 +108,19 @@ class TrainActionConfig:
     weight_decay: float = 1e-4
     num_workers: int = 2
     val_split: float = 0.2
+    loss: str = "cross_entropy"
     class_weight_balance: bool = True
     label_smoothing: float = 0.0
     early_stopping_patience: int = 0
+    early_stopping_metric: str = "val_loss"
     best_metric: str = "macro_f1"
+    classification_threshold: float = 0.5
+    min_lr_ratio: float = 0.05
+    max_pos_weight: float = 4.0
+    grad_clip_norm: float = 1.0
+    threshold_sweep_min: float = 0.10
+    threshold_sweep_max: float = 0.90
+    threshold_sweep_step: float = 0.05
     amp: bool = True
     output_dir: str = "models/action_player"
 

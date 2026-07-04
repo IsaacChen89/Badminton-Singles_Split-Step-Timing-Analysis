@@ -83,7 +83,7 @@ class RollingActionInference:
             return self._last_prob.get(player_id, 0.0)
         rgb = crop_bgr[:, :, ::-1]
         pil = Image.fromarray(rgb)
-        tensor = self.transform(pil)  # (3, H, W) on CPU
+        tensor = self.transform([pil])[0]  # (3, H, W) on CPU
         buf = self._ensure(player_id)
         buf.append(tensor)
         self._steps[player_id] = self._steps.get(player_id, 0) + 1
@@ -97,7 +97,10 @@ class RollingActionInference:
 
         clip = torch.stack(list(buf), dim=0).unsqueeze(0).to(self.device)
         logits = self.model(clip)
-        prob = torch.softmax(logits, dim=-1)[0, 1].item()
+        if logits.size(-1) == 1:
+            prob = torch.sigmoid(logits)[0, 0].item()
+        else:
+            prob = torch.softmax(logits, dim=-1)[0, 1].item()
         self._last_prob[player_id] = float(prob)
         return float(prob)
 
