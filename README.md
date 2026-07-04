@@ -60,7 +60,8 @@ badminton-splitstep-analyzer/
 │   │   ├── dataset.py
 │   │   ├── train.py
 │   │   ├── inference.py
-│   │   └── smoothing.py
+│   │   ├── smoothing.py
+│   │   └── plots.py
 │   ├── data/                       # I/O + the CVAT converter
 │   │   ├── cvat_converter.py       # ★ primary CVAT bridge
 │   │   └── video_io.py
@@ -106,14 +107,6 @@ python main.py info
 ## Run inference
 
 Annotate a video, producing `outputs/match_annotated.mp4`:
-
-```bash
-python main.py analyze \
-  --video  data/raw/match.mp4 \
-  --output outputs/match_annotated.mp4
-```
-
-Analyze with a specific run:
 
 ```bash
 python main.py analyze \
@@ -287,7 +280,7 @@ data/action/
   clips/<clip_id>/00.jpg ... 15.jpg
 ```
 
-Both datasets are split three ways. The defaults are **60% train / 20% val / 20% test** (controlled by `cvat.val_split` and `cvat.test_split` in `config.yaml`; the train share is implicit `1 - val - test`). The `split` column of `manifest.csv` holds one of `train`, `val`, or `test`, and the YOLO `data.yaml` includes a `test:` key for a held-out test split. Set `--test-split 0` (or `cvat.test_split: 0.0`) to reproduce the old two-way `train`/`val`-only behavior.
+Both datasets are split three ways. The defaults are **60% train / 20% val / 20% test** (`cvat.val_split` / `cvat.test_split`; train share is `1 - val - test`). With `group_split: true`, whole videos stay in one split. The `split` column of `manifest.csv` is `train`, `val`, or `test`. Set `--test-split 0` for train/val only.
 
 Override the file-naming suffix with `--suffix` (default `_cvat`):
 
@@ -372,21 +365,15 @@ python main.py train-action \
 
 Highlights:
 
-- ResNet18 (frozen by default) → BiLSTM(128) → 2-class linear head.
-- Class-weighted cross-entropy (badminton split steps are heavily
-imbalanced — most frames are "normal").
-- Cosine LR schedule, AdamW, AMP when CUDA is available.
-- Each run saved under `models/action_player_1/`, `models/action_player_2/`, …
-- Best checkpoint by macro-F1 (on val) saved to `action_best.pt` inside that run folder.
-- Per-epoch metrics in `train_history.json`; metadata in `run_info.json`.
-- **Training plots** in `training_curves.png` and (when a test split exists) `test_class_metrics.png`.
-  Re-generate with `python main.py plot-training --action-run 1`.
-- **End-of-training test eval** — when the manifest contains a `test`
-split, the best (by val F1) checkpoint is reloaded and scored on the
-held-out test clips. Loss, accuracy, macro-F1, and a per-class
-precision/recall report are persisted to `test_metrics.json` in the run folder.
+- ResNet18 (frozen by default) → BiLSTM → linear head. Set `action.num_classes: 1` with `train_action.loss: bce`, or `num_classes: 2` with `cross_entropy`.
+- Class weights optional (`class_weight_balance`); BCE `pos_weight` capped by `max_pos_weight`.
+- AdamW, per-epoch cosine LR (`min_lr_ratio`), gradient clipping (`grad_clip_norm`).
+- Validation uses a fixed threshold (0.5); best split-step threshold is swept once on val after training (`threshold_sweep_*`).
+- `best_metric` picks the checkpoint; `early_stopping_metric` controls when to stop (defaults: `split_step_f1` / `val_loss`).
+- Each run → `models/action_player_<N>/` with `action_best.pt`, `train_history.json`, `run_info.json`, plots, and `test_metrics.json` when a test split exists.
+- Re-generate plots: `python main.py plot-training --action-run 1`.
 
-`config.yaml` exposes every relevant knob (clip length, backbone, LSTM size, augmentations, etc.).
+See `action:` and `train_action:` in `config.yaml` for all knobs.
 
 ---
 
@@ -395,15 +382,17 @@ precision/recall report are persisted to `test_metrics.json` in the run folder.
 `config.yaml` is the single source of truth. CLI flags override individual fields. Sections:
 
 - `device` — `auto | cpu | cuda | mps` (`auto` prefers CUDA, then Apple MPS, then CPU)
-- `pipeline` — `frame_skip`, `output_fps`, `draw_hud`
+- `pipeline` — `frame_skip`, `target_fps`, `output_fps`, `draw_hud`
 - `detection` — YOLO model paths, conf/iou thresholds, `imgsz`, class
-filter, `max_det`
+  filter, `max_det`
 - `tracking` — `tracker_yaml` (`botsort.yaml` | `bytetrack.yaml`)
 - `assignment` — `top_is_player1`, `reassign_after_lost_frames`
-- `action` — backbone, clip length, LSTM size, freeze-backbone toggle
+- `action` — backbone, clip length/stride, `num_classes`, LSTM size,
+  `freeze_backbone`, dropout
 - `smoothing` — EMA `α`, hysteresis `prob_on/off`, `min_on_frames`,
-`cooldown_frames`
-- `train_action` / `train_yolo` — hyperparameters
+  `cooldown_frames`
+- `train_action` / `train_yolo` — hyperparameters (`loss`, `best_metric`,
+  `early_stopping_metric`, threshold sweep, class weights, etc.)
 - `cvat` — CVAT → dataset mapping:
   - `player1_label` / `player2_label` — track label(s) in your CVAT task.
     Use the same value for both when every player track shares one label
