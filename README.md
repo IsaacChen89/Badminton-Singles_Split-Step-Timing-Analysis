@@ -1,6 +1,6 @@
 # Badminton Singles — Split Step Timing Analysis
 
-The split step is an essential badminton skill. Correct timing can help player mover faster.
+The split step is an essential badminton skill. Correct timing can help a player move faster.
 
 ---
 
@@ -102,6 +102,8 @@ Verify your environment:
 python main.py info
 ```
 
+If you see `ModuleNotFoundError: No module named 'torch'`, activate `.venv` first.
+
 ---
 
 ## Run inference
@@ -119,7 +121,7 @@ python main.py analyze \
 - Input videos at any frame rate (25, 30, 60 FPS, …) are automatically resampled to **30 FPS** before being fed to the pipeline so the action model sees the same temporal cadence it was trained on. 
 - The annotated output MP4 is written at the same target rate. 
 - Override with `--target-fps <N>` or `pipeline.target_fps` in `config.yaml`; pass `--target-fps 0` (or set the config to `null`) to disable resampling and keep the source FPS.
-- Use `--yolo-run N` and `--action-run N` to pick versioned checkpoints, or pass explicit `--yolo-weights` / `--action-weights` paths. If no action checkpoint is found, `analyze` still writes bounding boxes — the `SPLIT STEP` label simply never fires.
+- Use `--yolo-run N` and `--action-run N` to pick versioned checkpoints (`models/yolo_player_<N>/`, `models/action_player_<N>/`), or pass explicit `--yolo-weights` / `--action-weights` paths. If no checkpoint is found, `analyze` falls back to legacy flat paths in `config.yaml`, then the stock YOLO weights. If no action checkpoint is found, `analyze` still writes bounding boxes — the `SPLIT STEP` label simply never fires.
 
 ---
 
@@ -220,7 +222,7 @@ In CVAT's label editor, choose **Mutable: yes** so the attribute can change per 
 
 1. Draw a track around the upper-court player at frame 0, then move forward and CVAT will interpolate. Adjust keyframes whenever the box drifts. (Convention A: label `player1`. Convention B: label `Player`, first track.)
 2. Repeat for the lower-court player. (Convention A: `player2`. Convention B: second `Player` track.)
-3. **For every frame** (or every keyframe — see the converter's `clip_stride`), set the action attribute when the player is in a split step:
+3. **For every frame** (or every Nth frame — see `action.clip_stride` in `config.yaml`, applied at `convert-cvat`), set the action attribute when the player is in a split step:
    - Convention A: `split_step = 1`, otherwise `0`
    - Convention B: `movement_state = split_step`, otherwise `normal`
 4. Save often.
@@ -276,9 +278,16 @@ data/yolo/
   labels/{train,val,test}/<video>_f000123.txt   # YOLO: 0 cx cy w h
 
 data/action/
-  manifest.csv    # clip_id, video, player_id, center_frame, label, split
+  manifest.csv    # clip_id, video, player_id, center_frame, label, target, split
   clips/<clip_id>/00.jpg ... 15.jpg
 ```
+
+`manifest.csv` includes:
+
+- `label` — hard 0/1 label (used for accuracy / F1 metrics)
+- `target` — soft BCE target in `[0, 1]` with transition ramps around split-step frames (see `cvat.positive_label_ratio`, `soft_transition_*` in `config.yaml`)
+
+Action clip density is controlled by `action.clip_stride` in `config.yaml` at **convert** time (not during `train-action`). Re-run `convert-cvat` after changing `clip_stride`.
 
 Both datasets are split three ways. The defaults are **60% train / 20% val / 20% test** (`cvat.val_split` / `cvat.test_split`; train share is `1 - val - test`). With `group_split: true`, whole videos stay in one split. The `split` column of `manifest.csv` is `train`, `val`, or `test`. Set `--test-split 0` for train/val only.
 
@@ -313,7 +322,7 @@ python main.py convert-cvat --auto --mode yolo  --val-split 0.2 --test-split 0.2
 python main.py convert-cvat --auto --mode action --clip-len 16 --val-split 0.2 --test-split 0.2
 ```
 
-Both `player1` and `player2` tracks collapse into a single `player` class for YOLO so a vanilla single-class detector trains out of the box. For action, each labeled frame becomes a clip of `clip-len` *trailing* frames so the label corresponds to the most recent frame — the same convention used at inference time.
+YOLO exports both players as one `player` class. Action export builds trailing clips (same as inference) with a hard `label` and a soft `target` for BCE — tuned via `cvat.positive_label_ratio`, `soft_transition_frames`, and `soft_transition_min` in `config.yaml`.
 
 ### CVAT label / attribute mapping
 
@@ -344,13 +353,14 @@ After running `convert-cvat --mode yolo` (or `--mode both`):
 ```bash
 python main.py train-yolo \
   --data data/yolo/data.yaml \
-  --base-model models/yolo26n.pt \
-  --epochs 50 \
+  --epochs 100 \
   --imgsz 640 \
-  --batch 16
+  --batch 32
 ```
 
-Each run is saved under an auto-incremented folder: `models/yolo_player_1/`, `models/yolo_player_2/`, … (`weights/best.pt`, `yolo_player_best.pt`, `results.csv`, plots, `run_info.json`). Gaps are preserved (if `_1` and `_3` exist, the next run is `_4`).
+Each run is saved under an auto-incremented folder: `models/yolo_player_1/`, `models/yolo_player_2/`, … (`weights/best.pt`, promoted `yolo_player_best.pt`, Ultralytics plots, `args.yaml`). Gaps are preserved (if `_1` and `_3` exist, the next run is `_4`).
+
+After training, pick a checkpoint with `--yolo-run N` in `analyze`, or pass `--yolo-weights models/yolo_player_<N>/yolo_player_best.pt`.
 
 ---
 
@@ -360,20 +370,33 @@ Each run is saved under an auto-incremented folder: `models/yolo_player_1/`, `mo
 python main.py train-action \
   --manifest data/action/manifest.csv \
   --epochs 30 \
-  --batch-size 16
+  --batch-size 32
 ```
 
-Highlights:
+Resume from a prior checkpoint with `--resume-run N` or `--resume path/to/action_best.pt` (weights only; other settings come from `config.yaml`):
 
-- ResNet18 (frozen by default) → BiLSTM → linear head. Set `action.num_classes: 1` with `train_action.loss: bce`, or `num_classes: 2` with `cross_entropy`.
-- Class weights optional (`class_weight_balance`); BCE `pos_weight` capped by `max_pos_weight`.
-- AdamW, per-epoch cosine LR (`min_lr_ratio`), gradient clipping (`grad_clip_norm`).
-- Validation uses a fixed threshold (0.5); best split-step threshold is swept once on val after training (`threshold_sweep_*`).
-- `best_metric` picks the checkpoint; `early_stopping_metric` controls when to stop (defaults: `split_step_f1` / `val_loss`).
-- Each run → `models/action_player_<N>/` with `action_best.pt`, `train_history.json`, `run_info.json`, plots, and `test_metrics.json` when a test split exists.
+```bash
+python main.py train-action --manifest data/action/manifest.csv --resume-run 1 --epochs 10
+```
+
+### Highlights
+
+- ResNet18 → BiLSTM → linear head. Set `action.num_classes: 1` with `train_action.loss: bce` (default), or `num_classes: 2` with `cross_entropy`.
+- `action.freeze_backbone: false` (default) fine-tunes the CNN; set `true` for head-only training (stage 1 in a two-stage schedule).
+- **Differential learning rates** when the backbone is unfrozen: `train_action.backbone_lr` and `train_action.head_lr` (fall back to `lr` when omitted). AdamW uses separate param groups; cosine decay applies per group.
+- BCE trains on soft `target` values from the manifest; metrics use hard `label`. Class weights optional (`class_weight_balance`); BCE `pos_weight` capped by `max_pos_weight`.
+- AdamW, per-epoch cosine LR (`min_lr_ratio`), gradient clipping (`grad_clip_norm`), optional AMP on CUDA.
+- Validation uses a fixed threshold (`classification_threshold`, default 0.5); best split-step threshold is swept once on val after training (`threshold_sweep_*`).
+- `best_metric` picks the checkpoint (default `split_step_f1`); `early_stopping_metric` controls early stopping (default `split_step_f1` in current `config.yaml`).
+- Each run → `models/action_player_<N>/` with `action_best.pt`, `action_last.pt`, `train_history.json`, `run_info.json`, `training_curves.png`, `test_metrics.json`, and `test_class_metrics.png` when a test split exists.
+- `run_info.json` records hyperparameters, `freeze_backbone`, `best_split_step_f1`, `test_split_step_f1`, `best_threshold`, and `resumed_from` when applicable.
 - Re-generate plots: `python main.py plot-training --action-run 1`.
 
-See `action:` and `train_action:` in `config.yaml` for all knobs.
+### Inference tuning
+
+Training metrics use CVAT crops; `analyze` uses YOLO crops plus `smoothing` hysteresis. If video labels look too strict, lower `smoothing.prob_on` (often ~0.22–0.35) and compare against `best_threshold` in `run_info.json`.
+
+See `action:`, `train_action:`, and `smoothing:` in `config.yaml` for all knobs.
 
 ---
 
@@ -387,12 +410,10 @@ See `action:` and `train_action:` in `config.yaml` for all knobs.
   filter, `max_det`
 - `tracking` — `tracker_yaml` (`botsort.yaml` | `bytetrack.yaml`)
 - `assignment` — `top_is_player1`, `reassign_after_lost_frames`
-- `action` — backbone, clip length/stride, `num_classes`, LSTM size,
-  `freeze_backbone`, dropout
-- `smoothing` — EMA `α`, hysteresis `prob_on/off`, `min_on_frames`,
-  `cooldown_frames`
-- `train_action` / `train_yolo` — hyperparameters (`loss`, `best_metric`,
-  `early_stopping_metric`, threshold sweep, class weights, etc.)
+- `action` — backbone, `clip_length` / `clip_stride` (stride used at **convert-cvat** time), `num_classes`, LSTM size, `freeze_backbone`, dropout
+- `smoothing` — EMA `α`, hysteresis `prob_on` / `prob_off`, `min_on_frames`, `cooldown_frames` (inference only)
+- `train_action` — hyperparameters (`loss`, `lr`, `backbone_lr`, `head_lr`, `best_metric`, `early_stopping_metric`, threshold sweep, class weights, `max_pos_weight`, etc.)
+- `train_yolo` — `base_model`, `epochs`, `imgsz`, `batch` (runs write to `models/yolo_player_<N>/`)
 - `cvat` — CVAT → dataset mapping:
   - `player1_label` / `player2_label` — track label(s) in your CVAT task.
     Use the same value for both when every player track shares one label
@@ -401,6 +422,8 @@ See `action:` and `train_action:` in `config.yaml` for all knobs.
   - `split_attribute` — per-frame box attribute that encodes split step vs.
     normal (e.g. `movement_state` with values `normal` / `split_step`, or
     `split_step` with values `0` / `1`).
+  - `positive_label_ratio`, `soft_transition_frames`, `soft_transition_min` — soft BCE window labels for action export
+  - `centered_action_clips` — trailing vs centered clip windows
   - `val_split` + `test_split` (defaults 0.2 + 0.2 ⇒ 60/20/20), frame
     subsampling via `every_n_frames`
 
