@@ -59,7 +59,7 @@ def save_training_plots(
     train_acc = [float(row["train_acc"]) for row in history]
     val_acc = [_safe_float(row.get("val_acc")) for row in history]
     val_f1 = [_safe_float(row.get("val_f1")) for row in history]
-    lr = [float(row["lr"]) for row in history]
+    lr_series = _learning_rate_series(history)
 
     fig, axes = plt.subplots(2, 2, figsize=(10, 8), tight_layout=True)
     fig.suptitle("Split-step model training", fontsize=13, fontweight="bold")
@@ -101,7 +101,11 @@ def save_training_plots(
     ax.grid(True, alpha=0.3)
 
     ax = axes[1, 1]
-    ax.plot(epochs, lr, color="#9467bd", linewidth=2)
+    if lr_series:
+        for name, values in lr_series.items():
+            if _any_finite(values):
+                ax.plot(epochs, values, linewidth=2, label=name)
+        ax.legend()
     ax.set_title("Learning rate")
     ax.set_xlabel("epoch")
     ax.grid(True, alpha=0.3)
@@ -181,6 +185,19 @@ def _save_test_class_plot(report: Mapping[str, Any], path: Path) -> None:
     ax.grid(True, axis="y", alpha=0.3)
     fig.savefig(path, dpi=150)
     plt.close(fig)
+
+
+def _learning_rate_series(history: History) -> dict[str, list[float]]:
+    has_backbone = any("backbone_lr" in row for row in history)
+    has_head = any("head_lr" in row for row in history)
+    if has_backbone and has_head:
+        return {
+            "backbone": [_safe_float(row.get("backbone_lr")) for row in history],
+            "head": [_safe_float(row.get("head_lr")) for row in history],
+        }
+    if any("lr" in row for row in history):
+        return {"lr": [_safe_float(row.get("lr")) for row in history]}
+    return {}
 
 
 def _safe_float(value: Any) -> float:

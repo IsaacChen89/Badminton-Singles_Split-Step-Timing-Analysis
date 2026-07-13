@@ -87,6 +87,21 @@ def _resolve_analyze_action(
     return config_default
 
 
+def _resolve_train_resume(
+    resume: Optional[Path],
+    resume_run: Optional[int],
+) -> Optional[str]:
+    from src.utils.model_runs import resolve_action_run_checkpoint
+
+    if resume is not None and resume_run is not None:
+        raise typer.BadParameter("Use either --resume or --resume-run, not both.")
+    if resume is not None:
+        return str(resume)
+    if resume_run is not None:
+        return str(resolve_action_run_checkpoint(resume_run))
+    return None
+
+
 # -------------------------------------------------------------------- #
 # analyze
 # -------------------------------------------------------------------- #
@@ -477,6 +492,10 @@ def convert_cvat(
         split_attribute=cfg.cvat.split_attribute,
         seed=cfg.seed,
         group_split=cfg.cvat.group_split and not no_group_split,
+        positive_label_ratio=cfg.cvat.positive_label_ratio,
+        soft_transition_frames=cfg.cvat.soft_transition_frames,
+        soft_transition_min=cfg.cvat.soft_transition_min,
+        centered_action_clips=cfg.cvat.centered_action_clips,
     )
 
 
@@ -502,13 +521,7 @@ def train_yolo(
 
     from ultralytics import YOLO
 
-    from src.utils.model_runs import (
-        YOLO_KIND,
-        allocate_run_dir,
-        project_relative,
-        utc_now_iso,
-        write_run_info,
-    )
+    from src.utils.model_runs import YOLO_KIND, allocate_run_dir, project_relative
     from src.utils.yolo_weights import (
         MODELS_DIR,
         promote_finetuned_best,
@@ -528,7 +541,7 @@ def train_yolo(
     n_batch = batch or cfg.train_yolo.batch
     logger = get_logger("train_yolo")
     logger.info(f"Training YOLO run {run} from base '{base_path}' on {data_path}")
-    logger.info(f"Saving run artifacts to {save_dir}")
+    logger.info(f"Saving artifacts to {save_dir}")
 
     load_target = str(base_path) if base_path.is_file() else base_spec
     with ultralytics_weights_cwd(MODELS_DIR.resolve()):
@@ -550,23 +563,10 @@ def train_yolo(
     promoted = promote_finetuned_best(save_dir)
     if promoted:
         logger.info(f"Fine-tuned detector for analyze: {promoted}")
-    write_run_info(
-        save_dir,
-        {
-            "run": run,
-            "kind": YOLO_KIND,
-            "created_at": utc_now_iso(),
-            "epochs": n_epochs,
-            "imgsz": n_imgsz,
-            "batch": n_batch,
-            "data": project_relative(data_path),
-            "base_model": project_relative(base_path),
-            "checkpoint": project_relative(promoted or best_src),
-        },
-    )
+    checkpoint = project_relative(promoted or best_src)
     logger.info(
         f"YOLO training complete (run {run}). "
-        f"Analyze with: --yolo-run {run}"
+        f"Analyze with: --yolo-run {run}  ({checkpoint})"
     )
 
 
@@ -580,9 +580,28 @@ def train_action_cmd(
     epochs: Optional[int] = typer.Option(None, "--epochs"),
     batch_size: Optional[int] = typer.Option(None, "--batch-size"),
     lr: Optional[float] = typer.Option(None, "--lr"),
+    backbone_lr: Optional[float] = typer.Option(
+        None, "--backbone-lr", help="LR for the CNN backbone when unfrozen."
+    ),
+    head_lr: Optional[float] = typer.Option(
+        None, "--head-lr", help="LR for the BiLSTM + classification head."
+    ),
     device: Optional[str] = typer.Option(None, "--device"),
     no_pretrained: bool = typer.Option(
         False, "--no-pretrained", help="Disable best-effort ImageNet weight load."
+    ),
+    resume: Optional[Path] = typer.Option(
+        None,
+        "--resume",
+        exists=True,
+        dir_okay=False,
+        help="Continue training from an action checkpoint (.pt).",
+    ),
+    resume_run: Optional[int] = typer.Option(
+        None,
+        "--resume-run",
+        min=1,
+        help="Continue training from models/action_player_<N>/action_best.pt.",
     ),
 ) -> None:
     """Train the split-step CNN-LSTM on the action dataset."""
@@ -596,7 +615,12 @@ def train_action_cmd(
         cfg.train_action.batch_size = batch_size
     if lr is not None:
         cfg.train_action.lr = lr
+    if backbone_lr is not None:
+        cfg.train_action.backbone_lr = backbone_lr
+    if head_lr is not None:
+        cfg.train_action.head_lr = head_lr
     resolved_device = resolve_device(cfg.device)
+    resume_checkpoint = _resolve_train_resume(resume, resume_run)
 
     from src.action.train import train as run_train
     from src.utils.model_runs import (
@@ -611,6 +635,8 @@ def train_action_cmd(
     cfg.train_action.output_dir = str(run_dir)
     logger = get_logger("train_action")
     logger.info(f"Training action run {run} -> {run_dir}")
+    if resume_checkpoint:
+        logger.info(f"Resuming weights from {resume_checkpoint}")
 
     result = run_train(
         manifest=manifest,
@@ -618,32 +644,43 @@ def train_action_cmd(
         train_cfg=cfg.train_action,
         device=resolved_device,
         seed=cfg.seed,
-        pretrained_imagenet=not no_pretrained,
+        pretrained_imagenet=not no_pretrained and resume_checkpoint is None,
+        resume_checkpoint=resume_checkpoint,
     )
+    run_info = {
+        "run": run,
+        "kind": ACTION_KIND,
+        "created_at": utc_now_iso(),
+        "epochs": cfg.train_action.epochs,
+        "batch_size": cfg.train_action.batch_size,
+        "lr": cfg.train_action.lr,
+        "backbone_lr": cfg.train_action.backbone_lr,
+        "head_lr": cfg.train_action.head_lr,
+        "weight_decay": cfg.train_action.weight_decay,
+        "freeze_backbone": cfg.action.freeze_backbone,
+        "loss": cfg.train_action.loss,
+        "class_weight_balance": cfg.train_action.class_weight_balance,
+        "manifest": project_relative(manifest),
+        "best_val_f1": result.best_val_f1,
+        "best_val_f1_kind": "macro_f1",
+        "best_split_step_f1": result.best_split_step_f1,
+        "best_val_acc": result.best_val_acc,
+        "best_epoch": result.best_epoch,
+        "best_metric": result.best_metric,
+        "best_metric_value": result.best_metric_value,
+        "early_stopping_metric": cfg.train_action.early_stopping_metric,
+        "best_threshold": result.best_threshold,
+        "test_f1": result.test_f1,
+        "test_f1_kind": "macro_f1",
+        "test_split_step_f1": result.test_split_step_f1,
+        "test_acc": result.test_acc,
+        "checkpoint": project_relative(result.checkpoint_path),
+    }
+    if result.resumed_from:
+        run_info["resumed_from"] = project_relative(result.resumed_from)
     write_run_info(
         run_dir,
-        {
-            "run": run,
-            "kind": ACTION_KIND,
-            "created_at": utc_now_iso(),
-            "epochs": cfg.train_action.epochs,
-            "batch_size": cfg.train_action.batch_size,
-            "lr": cfg.train_action.lr,
-            "weight_decay": cfg.train_action.weight_decay,
-            "loss": cfg.train_action.loss,
-            "class_weight_balance": cfg.train_action.class_weight_balance,
-            "manifest": project_relative(manifest),
-            "best_val_f1": result.best_val_f1,
-            "best_val_acc": result.best_val_acc,
-            "best_epoch": result.best_epoch,
-            "best_metric": result.best_metric,
-            "best_metric_value": result.best_metric_value,
-            "early_stopping_metric": cfg.train_action.early_stopping_metric,
-            "best_threshold": result.best_threshold,
-            "test_f1": result.test_f1,
-            "test_acc": result.test_acc,
-            "checkpoint": project_relative(result.checkpoint_path),
-        },
+        run_info,
     )
     logger.info(
         f"Action training complete (run {run}). "

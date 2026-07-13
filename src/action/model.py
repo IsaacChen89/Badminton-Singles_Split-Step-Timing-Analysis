@@ -85,9 +85,13 @@ class SplitStepCNNLSTM(nn.Module):
             "freeze_backbone": freeze_backbone,
         }
 
-        if freeze_backbone:
-            for p in self.backbone.parameters():
-                p.requires_grad = False
+        self.apply_freeze_backbone(freeze_backbone)
+
+    def apply_freeze_backbone(self, freeze: bool) -> None:
+        """Toggle backbone gradient flow and persist the choice in ``config``."""
+        for p in self.backbone.parameters():
+            p.requires_grad = not freeze
+        self.config["freeze_backbone"] = bool(freeze)
 
     def try_load_imagenet_weights(self) -> bool:
         """Best-effort load of ImageNet weights for the backbone.

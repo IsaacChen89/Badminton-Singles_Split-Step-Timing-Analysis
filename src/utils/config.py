@@ -105,6 +105,8 @@ class TrainActionConfig:
     epochs: int = 30
     batch_size: int = 16
     lr: float = 3e-4
+    backbone_lr: Optional[float] = None
+    head_lr: Optional[float] = None
     weight_decay: float = 1e-4
     num_workers: int = 2
     val_split: float = 0.2
@@ -141,6 +143,10 @@ class CvatConfig:
     player2_label: str = "player2"
     split_attribute: str = "split_step"
     yolo_class_name: str = "player"
+    positive_label_ratio: float = 0.15
+    soft_transition_frames: int = 3
+    soft_transition_min: float = 0.25
+    centered_action_clips: bool = False
     # Three-way split: train share is implicit (1 - val_split - test_split).
     val_split: float = 0.2
     test_split: float = 0.2
@@ -202,9 +208,21 @@ def load_config(path: str | Path = "config.yaml") -> AppConfig:
     )
 
 
+def _require_torch():
+    try:
+        import torch
+    except ModuleNotFoundError as exc:
+        raise RuntimeError(
+            "PyTorch is not installed in the active Python environment. "
+            "Activate the project virtualenv (`source .venv/bin/activate`) "
+            "or run with `.venv/bin/python`, then `pip install -r requirements.txt`."
+        ) from exc
+    return torch
+
+
 def mps_available() -> bool:
     """Return True when PyTorch can use Apple Metal (MPS)."""
-    import torch
+    torch = _require_torch()
 
     mps = getattr(torch.backends, "mps", None)
     return mps is not None and mps.is_available()
@@ -215,7 +233,7 @@ def resolve_device(requested: Device) -> str:
 
     ``auto`` prefers CUDA, then Apple MPS, then CPU.
     """
-    import torch
+    torch = _require_torch()
 
     if requested == "cpu":
         return "cpu"

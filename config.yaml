@@ -57,11 +57,11 @@ assignment:
 action:
   model_checkpoint: models/action_player/action_best.pt  # legacy; prefer --action-run N
   clip_length: 16          # T frames per clip
-  clip_stride: 2
+  clip_stride: 4
   input_size: 224
   num_classes: 1           # 2 for cross_entropy; use 1 for BCEWithLogitsLoss
   backbone: resnet18
-  freeze_backbone: true
+  freeze_backbone: false   
   lstm_hidden: 128
   lstm_layers: 1
   bidirectional: true
@@ -69,45 +69,46 @@ action:
 
 # Smoothing of split-step label
 smoothing:
-  ema_alpha: 0.4           # EMA over per-frame split-step probability
-  prob_on: 0.6             # probability to flip to ON (must be sustained for min_on_frames)
-  prob_off: 0.4            # probability to flip back to OFF (must be sustained for cooldown_frames)
+  ema_alpha: 0.5           # EMA over per-frame split-step probability
+  prob_on: 0.35             # probability to flip to ON (must be sustained for min_on_frames)
+  prob_off: 0.25            # probability to flip back to OFF (must be sustained for cooldown_frames)
   min_on_frames: 3         # minimum sustained frames to declare a split step
-  cooldown_frames: 6       # minimum sustained low-prob frames to clear it
+  cooldown_frames: 4        # minimum sustained low-prob frames to clear it
 
 # Training (action model)
 # Each train-action run writes to models/action_player_<N>/ (auto-incremented).
 train_action:
   epochs: 30
-  batch_size: 16
-  lr: 0.0001
+  batch_size: 32
+  lr: 0.00005              # fallback when backbone_lr/head_lr omitted
+  backbone_lr: 0.000003     # used when freeze_backbone=false (ResNet fine-tune)
+  head_lr: 0.00005         # BiLSTM + linear head
   weight_decay: 0.001
   num_workers: 2
   val_split: 0.2
   loss: bce                # cross_entropy | bce
-  class_weight_balance: true  # true pushes recall; hurts split-step precision
+  class_weight_balance: true  
   label_smoothing: 0.05     # only used by cross_entropy
   early_stopping_patience: 4
-  early_stopping_metric: val_loss  # stop when val loss plateaus
+  early_stopping_metric: split_step_f1
   best_metric: split_step_f1       # checkpoint selection metric
   min_lr_ratio: 0.05          # cosine floor = lr * min_lr_ratio
-  max_pos_weight: 3.0         # cap BCE positive weight when class_weight_balance
+  max_pos_weight: 2.0         # cap BCE positive weight when class_weight_balance
   grad_clip_norm: 1.0
   classification_threshold: 0.5  # fixed threshold during training; post-train val sweep below
-  threshold_sweep_min: 0.15
-  threshold_sweep_max: 0.85
-  threshold_sweep_step: 0.05
+  threshold_sweep_min: 0.25
+  threshold_sweep_max: 0.75
+  threshold_sweep_step: 0.01
   amp: true                # mixed precision when CUDA available
   output_dir: models/action_player  # overridden per run by train-action
 
 # Training (YOLO detector via ultralytics)
-# Stock base: models/yolo26n.pt
 # Each train-yolo run writes to models/yolo_player_<N>/ (auto-incremented).
 train_yolo:
   base_model: models/yolo26n.pt
-  epochs: 50
+  epochs: 100
   imgsz: 640
-  batch: 16
+  batch: 32
   project: models
   name: yolo_player
 
@@ -119,6 +120,10 @@ cvat:
   player2_label: Player
   split_attribute: movement_state
   yolo_class_name: player
+  positive_label_ratio: 0.15  # hard-positive threshold for soft window labels
+  soft_transition_frames: 2   # soften N normal frames before/after each split-step motion
+  soft_transition_min: 0.20   # outer transition target; ramps up to 1.0 near motion
+  centered_action_clips: false # keep causal trailing clips; true uses future context
   # Three-way split (train share is implicit: 1 - val_split - test_split).
   # Defaults give 60% train / 20% val / 20% test.
   val_split: 0.2

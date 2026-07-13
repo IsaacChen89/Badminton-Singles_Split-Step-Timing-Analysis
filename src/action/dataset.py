@@ -204,7 +204,7 @@ class SplitStepClipDataset(Dataset):
                 player_id=int(r["player_id"]),
                 center_frame=int(r["center_frame"]),
                 label=int(r["label"]),
-                target=float(r["label"]),
+                target=float(r["target"]) if "target" in df.columns else float(r["label"]),
                 split=split,
             )
             for _, r in df.iterrows()

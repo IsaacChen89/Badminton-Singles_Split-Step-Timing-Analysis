@@ -639,12 +639,21 @@ def export_action_dataset(
     crop_size: int = 224,
     seed: int = 42,
     group_split: bool = True,
+    positive_label_ratio: float = 0.15,
+    soft_transition_frames: int = 3,
+    soft_transition_min: float = 0.25,
+    centered_clips: bool = False,
 ) -> Path:
     """Export per-player crop clips for the action model.
 
     For each labeled frame ``f`` of a player track, we build a clip of
-    ``clip_length`` *trailing* frames (``f - clip_length + 1`` … ``f``). The
-    clip's label is the ``split_attribute`` value at frame ``f``.
+    ``clip_length`` frames. By default this is a trailing causal window
+    (``f - clip_length + 1`` … ``f``). If ``centered_clips`` is true, the
+    window is centered around ``f``. The manifest stores both a hard ``label``
+    for metrics and a soft ``target`` for BCE training. The soft target is the
+    average action value among labeled frames in the clip window. Positive
+    motion frames stay at 1.0; nearby normal frames can be softened by
+    ``soft_transition_frames`` so boundary timing is not punished as harshly.
 
     Clips are split three ways into ``train`` / ``val`` / ``test`` (the train
     share is implicit: ``1 - val_split - test_split``) and the chosen split
@@ -667,7 +676,10 @@ def export_action_dataset(
     total_clips = 0
     total_frames = 0
     total_skipped = 0
-    targets_by_stem: Dict[str, List[Tuple[int, int, int]]] = {}
+    positive_label_ratio = max(0.0, min(1.0, float(positive_label_ratio)))
+    soft_transition_frames = max(0, int(soft_transition_frames))
+    soft_transition_min = max(0.0, min(1.0, float(soft_transition_min)))
+    targets_by_stem: Dict[str, List[Tuple[int, int, int, float]]] = {}
     label_counts_by_stem: Dict[str, Dict[int, int]] = {}
 
     for job in job_list:
@@ -675,7 +687,7 @@ def export_action_dataset(
         track_to_pid = build_track_player_map(
             job.annotations.tracks, player1_label, player2_label
         )
-        targets: List[Tuple[int, int, int]] = []
+        labels_by_pid: Dict[int, Dict[int, int]] = {}
         for tr in job.annotations.tracks:
             pid = track_to_pid.get(tr.track_id)
             if pid is None:
@@ -686,9 +698,23 @@ def export_action_dataset(
                 label = box.action_label(split_attribute)
                 if label is None:
                     continue
+                labels_by_pid.setdefault(pid, {})[box.frame] = int(label)
                 if (box.frame % max(1, clip_stride)) != 0:
                     continue
-                targets.append((pid, box.frame, int(label)))
+        targets: List[Tuple[int, int, int, float]] = []
+        for pid, labels_by_frame in labels_by_pid.items():
+            soft_labels_by_frame = _soft_transition_labels(
+                labels_by_frame,
+                transition_frames=soft_transition_frames,
+                min_value=soft_transition_min,
+            )
+            for frame, label in sorted(labels_by_frame.items()):
+                if (frame % max(1, clip_stride)) != 0:
+                    continue
+                frames = _clip_frame_indices(frame, clip_length, centered=centered_clips)
+                target = _window_action_target(soft_labels_by_frame, frames, fallback=label)
+                hard_label = int(target >= positive_label_ratio)
+                targets.append((pid, frame, hard_label, target))
         if not targets:
             logger.warning(
                 f"[{stem}] no '{split_attribute}' targets found; skipping action export."
@@ -696,7 +722,7 @@ def export_action_dataset(
             continue
         targets.sort(key=lambda x: (x[1], x[0]))
         counts = {0: 0, 1: 0}
-        for _pid, _frame, label in targets:
+        for _pid, _frame, label, _target in targets:
             counts[label] = counts.get(label, 0) + 1
         targets_by_stem[stem] = targets
         label_counts_by_stem[stem] = counts
@@ -739,15 +765,16 @@ def export_action_dataset(
 
         # Map each needed source frame -> [(clip_idx, position_in_clip), ...]
         needed: Dict[int, List[Tuple[int, int]]] = {}
-        for clip_idx, (pid, center, _label) in enumerate(targets):
-            for k in range(clip_length):
-                f = center - (clip_length - 1 - k)
+        for clip_idx, (pid, center, _label, _target) in enumerate(targets):
+            for k, f in enumerate(
+                _clip_frame_indices(center, clip_length, centered=centered_clips)
+            ):
                 if f < 0:
                     continue
                 needed.setdefault(f, []).append((clip_idx, k))
 
         clip_dirs: List[Path] = []
-        for clip_idx, (pid, center, label) in enumerate(targets):
+        for clip_idx, (pid, center, label, target) in enumerate(targets):
             clip_id = f"{stem}_p{pid}_f{center:06d}_c{clip_idx:06d}"
             cdir = clips_dir / clip_id
             cdir.mkdir(parents=True, exist_ok=True)
@@ -767,6 +794,7 @@ def export_action_dataset(
                     "player_id": str(pid),
                     "center_frame": str(center),
                     "label": str(label),
+                    "target": f"{target:.6f}",
                     "split": split,
                 }
             )
@@ -780,7 +808,7 @@ def export_action_dataset(
                 if not uses:
                     continue
                 for clip_idx, position in uses:
-                    pid, _center, _label = targets[clip_idx]
+                    pid, _center, _label, _target = targets[clip_idx]
                     box = track_boxes[pid].get(frame_idx)
                     if box is None:
                         nearest = _nearest_box(track_boxes[pid], frame_idx)
@@ -819,7 +847,15 @@ def export_action_dataset(
     with manifest_path.open("w", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(
             f,
-            fieldnames=["clip_id", "video", "player_id", "center_frame", "label", "split"],
+            fieldnames=[
+                "clip_id",
+                "video",
+                "player_id",
+                "center_frame",
+                "label",
+                "target",
+                "split",
+            ],
         )
         writer.writeheader()
         writer.writerows(manifest_rows)
@@ -845,6 +881,80 @@ def _nearest_box(per_frame: Dict[int, CvatBox], frame_idx: int) -> Optional[Cvat
     return per_frame.get(best) if best is not None else None
 
 
+def _clip_frame_indices(center: int, clip_length: int, *, centered: bool = False) -> List[int]:
+    clip_length = max(1, int(clip_length))
+    if centered:
+        before = clip_length // 2
+        start = center - before
+    else:
+        start = center - clip_length + 1
+    return [start + i for i in range(clip_length)]
+
+
+def _soft_transition_labels(
+    labels_by_frame: Dict[int, int],
+    *,
+    transition_frames: int,
+    min_value: float,
+) -> Dict[int, float]:
+    """Return per-frame soft targets with ramps around positive intervals.
+
+    Hard positive frames stay at 1.0. Labeled normal frames up to
+    ``transition_frames`` before/after a positive interval receive a linearly
+    tapered target from ``min_value`` at the outer edge to nearly 1.0 at the
+    interval boundary. Frames far from positives remain 0.0.
+    """
+    soft = {frame: float(int(label) == 1) for frame, label in labels_by_frame.items()}
+    if transition_frames <= 0 or not labels_by_frame:
+        return soft
+
+    positive_frames = sorted(frame for frame, label in labels_by_frame.items() if int(label) == 1)
+    if not positive_frames:
+        return soft
+
+    intervals: List[Tuple[int, int]] = []
+    start = positive_frames[0]
+    prev = positive_frames[0]
+    for frame in positive_frames[1:]:
+        if frame == prev + 1:
+            prev = frame
+            continue
+        intervals.append((start, prev))
+        start = frame
+        prev = frame
+    intervals.append((start, prev))
+
+    labeled_frames = set(labels_by_frame)
+    for start, end in intervals:
+        for offset in range(1, transition_frames + 1):
+            value = _transition_value(offset, transition_frames, min_value)
+            before = start - offset
+            after = end + offset
+            if before in labeled_frames and int(labels_by_frame[before]) == 0:
+                soft[before] = max(soft.get(before, 0.0), value)
+            if after in labeled_frames and int(labels_by_frame[after]) == 0:
+                soft[after] = max(soft.get(after, 0.0), value)
+    return soft
+
+
+def _transition_value(offset: int, transition_frames: int, min_value: float) -> float:
+    # offset=1 is closest to the motion interval and should be strongest.
+    strength = (transition_frames - offset + 1) / (transition_frames + 1)
+    return max(0.0, min(1.0, min_value + (1.0 - min_value) * strength))
+
+
+def _window_action_target(
+    labels_by_frame: Dict[int, float],
+    frame_indices: Sequence[int],
+    *,
+    fallback: int | float,
+) -> float:
+    labels = [labels_by_frame[f] for f in frame_indices if f in labels_by_frame]
+    if not labels:
+        return float(fallback)
+    return float(sum(labels) / len(labels))
+
+
 # -------------------------------------------------------------------- #
 # High-level convenience: do both YOLO and action in one call
 # -------------------------------------------------------------------- #
@@ -867,6 +977,10 @@ def convert_cvat(
     split_attribute: str = "split_step",
     seed: int = 42,
     group_split: bool = True,
+    positive_label_ratio: float = 0.15,
+    soft_transition_frames: int = 3,
+    soft_transition_min: float = 0.25,
+    centered_action_clips: bool = False,
 ) -> Dict[str, Path]:
     """Run YOLO + action exports in one shot.
 
@@ -907,6 +1021,10 @@ def convert_cvat(
             crop_size=crop_size,
             seed=seed,
             group_split=group_split,
+            positive_label_ratio=positive_label_ratio,
+            soft_transition_frames=soft_transition_frames,
+            soft_transition_min=soft_transition_min,
+            centered_clips=centered_action_clips,
         )
     return out
 

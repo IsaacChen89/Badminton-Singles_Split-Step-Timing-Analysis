@@ -37,10 +37,13 @@ class TrainResult:
     best_metric: str = "macro_f1"
     best_metric_value: Optional[float] = None
     best_threshold: Optional[float] = None
+    best_split_step_f1: Optional[float] = None
     test_acc: Optional[float] = None
     test_f1: Optional[float] = None
+    test_split_step_f1: Optional[float] = None
     test_loss: Optional[float] = None
     test_report: Optional[dict] = None
+    resumed_from: Optional[str] = None
 
 
 @dataclass
@@ -264,6 +267,130 @@ def _metric_improved(current: float, best: float, metric_name: str) -> bool:
     return current < best
 
 
+def _effective_head_lr(train_cfg: TrainActionConfig) -> float:
+    if train_cfg.head_lr is not None:
+        return float(train_cfg.head_lr)
+    return float(train_cfg.lr)
+
+
+def _effective_backbone_lr(train_cfg: TrainActionConfig) -> float:
+    if train_cfg.backbone_lr is not None:
+        return float(train_cfg.backbone_lr)
+    return float(train_cfg.lr)
+
+
+def _uses_differential_lr(action_cfg: ActionConfig, train_cfg: TrainActionConfig) -> bool:
+    if action_cfg.freeze_backbone:
+        return False
+    if train_cfg.backbone_lr is None and train_cfg.head_lr is None:
+        return False
+    return True
+
+
+def _head_parameters(model: nn.Module) -> list[nn.Parameter]:
+    params: list[nn.Parameter] = []
+    for module in (getattr(model, "lstm", None), getattr(model, "head", None)):
+        if module is None:
+            continue
+        params.extend(p for p in module.parameters() if p.requires_grad)
+    return params
+
+
+def _build_optimizer(
+    model: nn.Module,
+    action_cfg: ActionConfig,
+    train_cfg: TrainActionConfig,
+) -> torch.optim.AdamW:
+    weight_decay = float(train_cfg.weight_decay)
+    if _uses_differential_lr(action_cfg, train_cfg):
+        backbone_params = [p for p in model.backbone.parameters() if p.requires_grad]
+        head_params = _head_parameters(model)
+        if not backbone_params or not head_params:
+            raise RuntimeError(
+                "Differential LR requires both backbone and head to be trainable."
+            )
+        backbone_lr = _effective_backbone_lr(train_cfg)
+        head_lr = _effective_head_lr(train_cfg)
+        optimizer = torch.optim.AdamW(
+            [
+                {"params": backbone_params, "lr": backbone_lr},
+                {"params": head_params, "lr": head_lr},
+            ],
+            weight_decay=weight_decay,
+        )
+        logger.info(
+            f"Optimizer: AdamW differential LR  "
+            f"backbone={backbone_lr:g}  head={head_lr:g}  wd={weight_decay:g}"
+        )
+        return optimizer
+
+    lr = _effective_head_lr(train_cfg)
+    trainable = [p for p in model.parameters() if p.requires_grad]
+    if not trainable:
+        raise RuntimeError("No trainable parameters found.")
+    optimizer = torch.optim.AdamW(trainable, lr=lr, weight_decay=weight_decay)
+    logger.info(f"Optimizer: AdamW lr={lr:g}  wd={weight_decay:g}")
+    return optimizer
+
+
+def _build_scheduler(
+    optimizer: torch.optim.Optimizer,
+    train_cfg: TrainActionConfig,
+) -> torch.optim.lr_scheduler.LambdaLR:
+    """Cosine decay to ``min_lr_ratio`` of each group's initial LR.
+
+    Uses ``LambdaLR`` so multi-group optimizers (differential LR) work on all
+    PyTorch versions; ``CosineAnnealingLR`` only accepts a scalar ``eta_min``.
+    """
+    min_lr_ratio = max(0.0, float(train_cfg.min_lr_ratio))
+    t_max = max(1, int(train_cfg.epochs))
+
+    def _cosine_multiplier(epoch: int) -> float:
+        # LambdaLR passes last_epoch (0 on first step); align with CosineAnnealingLR
+        # which uses last_epoch + 1 after the same training epoch.
+        progress = min(epoch + 1, t_max) / t_max
+        cosine = (1.0 + math.cos(math.pi * progress)) / 2.0
+        return min_lr_ratio + (1.0 - min_lr_ratio) * cosine
+
+    return torch.optim.lr_scheduler.LambdaLR(
+        optimizer,
+        lr_lambda=[_cosine_multiplier for _ in optimizer.param_groups],
+    )
+
+
+def _optimizer_lr_snapshot(optimizer: torch.optim.Optimizer) -> dict[str, float]:
+    if len(optimizer.param_groups) == 1:
+        return {"lr": float(optimizer.param_groups[0]["lr"])}
+    labels = ("backbone_lr", "head_lr")
+    snapshot: dict[str, float] = {}
+    for idx, group in enumerate(optimizer.param_groups):
+        key = labels[idx] if idx < len(labels) else f"group_{idx}_lr"
+        snapshot[key] = float(group["lr"])
+    return snapshot
+
+
+def _warn_checkpoint_config_mismatch(
+    model: nn.Module,
+    action_cfg: ActionConfig,
+) -> None:
+    """Log when resume checkpoint architecture differs from the current config."""
+    ckpt_cfg = getattr(model, "config", {})
+    checks = {
+        "backbone": action_cfg.backbone,
+        "num_classes": action_cfg.num_classes,
+        "lstm_hidden": action_cfg.lstm_hidden,
+        "lstm_layers": action_cfg.lstm_layers,
+        "bidirectional": action_cfg.bidirectional,
+    }
+    for key, expected in checks.items():
+        saved = ckpt_cfg.get(key)
+        if saved is not None and saved != expected:
+            logger.warning(
+                f"Resume checkpoint {key}={saved!r} differs from config {expected!r}; "
+                "using checkpoint weights as-is."
+            )
+
+
 def train(
     manifest: str | Path,
     action_cfg: ActionConfig,
@@ -271,6 +398,7 @@ def train(
     device: str = "cpu",
     seed: int = 42,
     pretrained_imagenet: bool = True,
+    resume_checkpoint: str | Path | None = None,
 ) -> TrainResult:
     """Train the split-step CNN-LSTM and save the best checkpoint."""
     _seed_everything(seed)
@@ -339,9 +467,30 @@ def train(
         else None
     )
 
-    model = build_model(action_cfg).to(device)
-    if pretrained_imagenet:
-        model.try_load_imagenet_weights()
+    resumed_from: Optional[str] = None
+    if resume_checkpoint is not None:
+        resume_path = Path(resume_checkpoint)
+        if not resume_path.exists():
+            raise FileNotFoundError(resume_path)
+        model = load_checkpoint(resume_path, map_location=device).to(device)
+        _warn_checkpoint_config_mismatch(model, action_cfg)
+        model.apply_freeze_backbone(action_cfg.freeze_backbone)
+        resumed_from = str(resume_path)
+        n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        logger.info(
+            f"Resumed from {resume_path}  |  freeze_backbone={action_cfg.freeze_backbone}  "
+            f"|  trainable params={n_trainable:,}"
+        )
+    else:
+        model = build_model(action_cfg).to(device)
+        imagenet_loaded = False
+        if pretrained_imagenet:
+            imagenet_loaded = model.try_load_imagenet_weights()
+        if action_cfg.freeze_backbone and not imagenet_loaded:
+            raise RuntimeError(
+                "action.freeze_backbone=true requires ImageNet backbone weights. "
+                "Either allow pretrained loading or set action.freeze_backbone=false."
+            )
 
     label_smoothing = max(0.0, min(1.0, float(train_cfg.label_smoothing)))
     if use_bce:
@@ -369,16 +518,8 @@ def train(
         if label_smoothing > 0:
             logger.info(f"Label smoothing: {label_smoothing:.3f}")
 
-    trainable = [p for p in model.parameters() if p.requires_grad]
-    if not trainable:
-        raise RuntimeError("No trainable parameters found.")
-    optimizer = torch.optim.AdamW(
-        trainable, lr=train_cfg.lr, weight_decay=train_cfg.weight_decay
-    )
-    min_lr = max(0.0, float(train_cfg.lr) * float(train_cfg.min_lr_ratio))
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=train_cfg.epochs, eta_min=min_lr
-    )
+    optimizer = _build_optimizer(model, action_cfg, train_cfg)
+    scheduler = _build_scheduler(optimizer, train_cfg)
 
     use_amp = bool(train_cfg.amp and device_supports_amp(device))
     scaler = torch.amp.GradScaler("cuda") if use_amp else None
@@ -397,6 +538,7 @@ def train(
     )
     best_f1 = -math.inf
     best_acc = 0.0
+    best_split_step_f1 = float("nan")
     best_epoch: Optional[int] = None
     best_threshold = float(train_cfg.classification_threshold)
     fixed_threshold = float(train_cfg.classification_threshold)
@@ -504,7 +646,7 @@ def train(
             "val_best_metric_value": val_score,
             "val_stop_metric": stop_metric_name,
             "val_stop_metric_value": stop_score,
-            "lr": optimizer.param_groups[0]["lr"],
+            **_optimizer_lr_snapshot(optimizer),
         }
         history.append(epoch_log)
         logger.info(
@@ -519,6 +661,7 @@ def train(
             best_score = val_score
             best_f1 = val_f1
             best_acc = val_acc
+            best_split_step_f1 = val_split_f1
             best_epoch = epoch
             save_checkpoint(
                 model,
@@ -528,6 +671,7 @@ def train(
                     "val_f1": val_f1,
                     "val_acc": val_acc,
                     "val_loss": val_loss,
+                    "val_split_step_f1": val_split_f1,
                     "best_metric": best_metric_name,
                     "best_metric_value": val_score,
                     "classification_threshold": fixed_threshold,
@@ -557,6 +701,7 @@ def train(
         save_checkpoint(model, best_path, extra={"epoch": train_cfg.epochs})
         best_f1 = float("nan")
         best_acc = float("nan")
+        best_split_step_f1 = float("nan")
         best_score = float("nan")
 
     (out_dir / "train_history.json").write_text(json.dumps(history, indent=2))
@@ -588,6 +733,7 @@ def train(
             swept_val = _sweep_threshold(val_outputs, train_cfg, best_metric_name)
             best_threshold = swept_val.threshold
             swept_split_f1 = _class_report_metric(swept_val.report, "1", "f1-score")
+            best_split_step_f1 = swept_split_f1
             logger.info(
                 f"Post-train val sweep | {best_metric_name} {swept_split_f1:.3f} "
                 f"| thr {best_threshold:.2f}"
@@ -599,6 +745,7 @@ def train(
                     "epoch": best_epoch,
                     "val_f1": best_f1,
                     "val_acc": best_acc,
+                    "val_split_step_f1": best_split_step_f1,
                     "best_metric": best_metric_name,
                     "best_metric_value": best_score,
                     "classification_threshold": best_threshold,
@@ -609,6 +756,7 @@ def train(
 
     test_acc: Optional[float] = None
     test_f1: Optional[float] = None
+    test_split_step_f1: Optional[float] = None
     test_loss: Optional[float] = None
     test_report: Optional[dict] = None
     if test_loader is not None:
@@ -626,6 +774,7 @@ def train(
         test_f1 = test_metrics.f1
         test_report = test_metrics.report
         test_split_f1 = _class_report_metric(test_metrics.report, "1", "f1-score")
+        test_split_step_f1 = test_split_f1
         logger.info(
             f"Test  | loss {test_loss:.4f}  acc {test_acc:.3f}  f1 {test_f1:.3f} "
             f"| split_f1 {test_split_f1:.3f}  thr {best_threshold:.2f}"
@@ -653,8 +802,11 @@ def train(
         best_metric=best_metric_name,
         best_metric_value=None if math.isnan(best_score) else best_score,
         best_threshold=best_threshold,
+        best_split_step_f1=None if math.isnan(best_split_step_f1) else best_split_step_f1,
         test_acc=test_acc,
         test_f1=test_f1,
+        test_split_step_f1=test_split_step_f1,
         test_loss=test_loss,
         test_report=test_report,
+        resumed_from=resumed_from,
     )
