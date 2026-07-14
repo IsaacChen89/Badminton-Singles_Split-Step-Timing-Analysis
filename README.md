@@ -27,6 +27,12 @@ A Python pipeline framework and training environment built with PyTorch, designe
 
 ---
 
+## Result
+
+![Annotated match demo](output_video.gif)
+
+---
+
 ## Table of contents
 
 1. [Project layout](#project-layout)
