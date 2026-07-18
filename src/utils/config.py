@@ -89,6 +89,7 @@ class ActionConfig:
     lstm_layers: int = 1
     bidirectional: bool = True
     dropout: float = 0.2
+    feature_dropout: float = 0.25  # between backbone and BiLSTM
 
 
 @dataclass

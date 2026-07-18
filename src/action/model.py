@@ -55,11 +55,14 @@ class SplitStepCNNLSTM(nn.Module):
         lstm_layers: int = 1,
         bidirectional: bool = True,
         dropout: float = 0.2,
+        feature_dropout: float = 0.25,
         freeze_backbone: bool = True,
     ) -> None:
         super().__init__()
         self.backbone, feat_dim = _build_backbone(backbone_name)
         self.feat_dim = feat_dim
+        # Regularize CNN features before the temporal model (head dropout is separate).
+        self.feature_dropout = nn.Dropout(feature_dropout)
         self.lstm = nn.LSTM(
             input_size=feat_dim,
             hidden_size=lstm_hidden,
@@ -82,6 +85,7 @@ class SplitStepCNNLSTM(nn.Module):
             "lstm_layers": lstm_layers,
             "bidirectional": bidirectional,
             "dropout": dropout,
+            "feature_dropout": feature_dropout,
             "freeze_backbone": freeze_backbone,
         }
 
@@ -139,6 +143,7 @@ class SplitStepCNNLSTM(nn.Module):
         b, t, c, h, w = clips.shape
         feats = self.backbone(clips.view(b * t, c, h, w))
         feats = feats.view(b, t, -1)
+        feats = self.feature_dropout(feats)
         out, _ = self.lstm(feats)
         # Predict from the final timestep -> labels the most recent frame.
         last = out[:, -1, :]
@@ -154,6 +159,7 @@ def build_model(cfg: ActionConfig) -> SplitStepCNNLSTM:
         lstm_layers=cfg.lstm_layers,
         bidirectional=cfg.bidirectional,
         dropout=cfg.dropout,
+        feature_dropout=cfg.feature_dropout,
         freeze_backbone=cfg.freeze_backbone,
     )
 
@@ -186,6 +192,7 @@ def load_checkpoint(
         lstm_layers=cfg.get("lstm_layers", 1),
         bidirectional=cfg.get("bidirectional", True),
         dropout=cfg.get("dropout", 0.2),
+        feature_dropout=cfg.get("feature_dropout", 0.0),
         freeze_backbone=cfg.get("freeze_backbone", True),
     )
     model.load_state_dict(payload["model_state"])
