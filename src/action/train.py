@@ -143,6 +143,10 @@ def _threshold_grid(train_cfg: TrainActionConfig) -> np.ndarray:
     return np.clip(grid, 0.0, 1.0)
 
 
+def _metric_uses_threshold(metric_name: str) -> bool:
+    return _normalize_metric_name(metric_name) not in {"val_loss", "loss"}
+
+
 def _sweep_threshold(
     outputs: EvalOutputs,
     train_cfg: TrainActionConfig,
@@ -184,6 +188,31 @@ def evaluate_model(
     if outputs.labels.size == 0:
         return EvalMetrics(loss=float("nan"), acc=float("nan"), f1=float("nan"))
     return _metrics_from_probs(outputs.probs, outputs.labels, threshold, loss=outputs.loss)
+
+
+@torch.inference_mode()
+def evaluate_with_threshold_sweep(
+    model: nn.Module,
+    loader: DataLoader,
+    criterion: nn.Module,
+    device: str,
+    train_cfg: TrainActionConfig,
+    use_bce: bool = False,
+    sweep_metric_name: str = "split_step_f1",
+    fallback_threshold: float = 0.5,
+) -> EvalMetrics:
+    """Forward once, then pick the best classification threshold on val."""
+    outputs = collect_eval_outputs(model, loader, criterion, device, use_bce=use_bce)
+    if outputs.labels.size == 0:
+        return EvalMetrics(loss=float("nan"), acc=float("nan"), f1=float("nan"))
+    if _metric_uses_threshold(sweep_metric_name):
+        return _sweep_threshold(outputs, train_cfg, sweep_metric_name)
+    return _metrics_from_probs(
+        outputs.probs,
+        outputs.labels,
+        fallback_threshold,
+        loss=outputs.loss,
+    )
 
 
 def _seed_everything(seed: int) -> None:
@@ -541,12 +570,14 @@ def train(
     best_split_step_f1 = float("nan")
     best_epoch: Optional[int] = None
     best_threshold = float(train_cfg.classification_threshold)
-    fixed_threshold = float(train_cfg.classification_threshold)
+    fallback_threshold = float(train_cfg.classification_threshold)
     epochs_without_improvement = 0
     grad_clip_norm = max(0.0, float(train_cfg.grad_clip_norm))
     logger.info(
-        "Validation during training uses fixed threshold "
-        f"{fixed_threshold:.2f}; threshold sweep runs once on val after training."
+        "Validation sweeps threshold each epoch: "
+        f"{train_cfg.threshold_sweep_min:.2f}..{train_cfg.threshold_sweep_max:.2f} "
+        f"step {train_cfg.threshold_sweep_step:.2f} "
+        f"(optimizing {best_metric_name}; fallback {fallback_threshold:.2f})"
     )
     logger.info(
         f"Checkpoint metric: {best_metric_name}  |  "
@@ -609,15 +640,17 @@ def train(
         val_split_support = 0.0
         val_score = float("nan")
         stop_score = float("nan")
-        val_threshold = fixed_threshold
+        val_threshold = fallback_threshold
         if val_loader is not None:
-            val_metrics = evaluate_model(
+            val_metrics = evaluate_with_threshold_sweep(
                 model,
                 val_loader,
                 criterion,
                 device,
+                train_cfg,
                 use_bce=use_bce,
-                threshold=fixed_threshold,
+                sweep_metric_name=best_metric_name,
+                fallback_threshold=fallback_threshold,
             )
             val_loss = val_metrics.loss
             val_acc = val_metrics.acc
@@ -652,7 +685,7 @@ def train(
         logger.info(
             f"epoch {epoch:03d} | train_loss {train_loss:.4f} acc {train_acc:.3f} "
             f"| val_loss {val_loss:.4f} acc {val_acc:.3f} f1 {val_f1:.3f} "
-            f"| split_f1 {val_split_f1:.3f}"
+            f"| split_f1 {val_split_f1:.3f} thr {val_threshold:.2f}"
         )
 
         save_checkpoint(model, last_path, extra={"epoch": epoch})
@@ -662,6 +695,7 @@ def train(
             best_f1 = val_f1
             best_acc = val_acc
             best_split_step_f1 = val_split_f1
+            best_threshold = val_threshold
             best_epoch = epoch
             save_checkpoint(
                 model,
@@ -674,7 +708,7 @@ def train(
                     "val_split_step_f1": val_split_f1,
                     "best_metric": best_metric_name,
                     "best_metric_value": val_score,
-                    "classification_threshold": fixed_threshold,
+                    "classification_threshold": best_threshold,
                 },
             )
             logger.info(
@@ -719,40 +753,6 @@ def train(
                 f"Could not reload best checkpoint ({exc}); "
                 f"falling back to in-memory model."
             )
-
-    if val_loader is not None:
-        logger.info(
-            "Sweeping split-step threshold on validation: "
-            f"{train_cfg.threshold_sweep_min:.2f}..{train_cfg.threshold_sweep_max:.2f} "
-            f"step {train_cfg.threshold_sweep_step:.2f}"
-        )
-        val_outputs = collect_eval_outputs(
-            best_model, val_loader, criterion, device, use_bce=use_bce
-        )
-        if val_outputs.labels.size > 0:
-            swept_val = _sweep_threshold(val_outputs, train_cfg, best_metric_name)
-            best_threshold = swept_val.threshold
-            swept_split_f1 = _class_report_metric(swept_val.report, "1", "f1-score")
-            best_split_step_f1 = swept_split_f1
-            logger.info(
-                f"Post-train val sweep | {best_metric_name} {swept_split_f1:.3f} "
-                f"| thr {best_threshold:.2f}"
-            )
-            save_checkpoint(
-                best_model,
-                best_path,
-                extra={
-                    "epoch": best_epoch,
-                    "val_f1": best_f1,
-                    "val_acc": best_acc,
-                    "val_split_step_f1": best_split_step_f1,
-                    "best_metric": best_metric_name,
-                    "best_metric_value": best_score,
-                    "classification_threshold": best_threshold,
-                },
-            )
-        else:
-            logger.warning("Empty validation split; keeping fixed classification threshold.")
 
     test_acc: Optional[float] = None
     test_f1: Optional[float] = None

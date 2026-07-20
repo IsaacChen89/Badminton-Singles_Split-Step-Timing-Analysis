@@ -65,8 +65,8 @@ action:
   lstm_hidden: 128
   lstm_layers: 1
   bidirectional: true
-  dropout: 0.5            # after BiLSTM, in classification head
-  feature_dropout: 0.3   # between ResNet features and BiLSTM
+  dropout: 0.6            # after BiLSTM, in classification head
+  feature_dropout: 0.5   # between ResNet features and BiLSTM
 
 # Smoothing of split-step label
 smoothing:
@@ -81,9 +81,9 @@ smoothing:
 train_action:
   epochs: 30
   batch_size: 32
-  lr: 0.00003              # fallback when backbone_lr/head_lr omitted
-  backbone_lr: 0.0000005     # used when freeze_backbone=false (ResNet fine-tune)
-  head_lr: 0.00003         # BiLSTM + linear head
+  lr: 0.00005              # fallback when backbone_lr/head_lr omitted
+  backbone_lr: 0.000003     # used when freeze_backbone=false (ResNet fine-tune)
+  head_lr: 0.00005         # BiLSTM + linear head
   weight_decay: 0.001
   num_workers: 2
   val_split: 0.2
@@ -93,12 +93,12 @@ train_action:
   early_stopping_patience: 4
   early_stopping_metric: split_step_f1
   best_metric: split_step_f1       # checkpoint selection metric
-  min_lr_ratio: 0.005          # cosine floor = lr * min_lr_ratio
+  min_lr_ratio: 0.05          # cosine floor = lr * min_lr_ratio
   max_pos_weight: 2.0         # cap BCE positive weight when class_weight_balance
   grad_clip_norm: 1.0
-  classification_threshold: 0.5  # fixed threshold during training; post-train val sweep below
+  classification_threshold: 0.5  # fallback when best_metric is val_loss; otherwise per-epoch sweep
   threshold_sweep_min: 0.25
-  threshold_sweep_max: 0.75
+  threshold_sweep_max: 0.65
   threshold_sweep_step: 0.01
   amp: true                # mixed precision when CUDA available
   output_dir: models/action_player  # overridden per run by train-action
@@ -121,9 +121,9 @@ cvat:
   player2_label: Player
   split_attribute: movement_state
   yolo_class_name: player
-  positive_label_ratio: 0.25  # hard-positive threshold for soft window labels
-  soft_transition_frames: 0   # soften N normal frames before/after each split-step motion
-  soft_transition_min: 0   # outer transition target; ramps up to 1.0 near motion
+  positive_label_ratio: 0.3  # hard-positive threshold for soft window labels
+  soft_transition_frames: 2   # soften N normal frames before/after each split-step motion
+  soft_transition_min: 0.2   # outer transition target; ramps up to 1.0 near motion
   centered_action_clips: false # keep causal trailing clips; true uses future context
   # Three-way split (train share is implicit: 1 - val_split - test_split).
   # Defaults give 60% train / 20% val / 20% test.
