@@ -61,18 +61,19 @@ action:
   input_size: 224
   num_classes: 1           # 2 for cross_entropy; use 1 for BCEWithLogitsLoss
   backbone: resnet18
-  freeze_backbone: false   
+  freeze_backbone: false
+  freeze_batchnorm_stats: true # keep pretrained BN statistics fixed while fine-tuning
   lstm_hidden: 128
   lstm_layers: 1
   bidirectional: true
-  dropout: 0.6            # after BiLSTM, in classification head
-  feature_dropout: 0.5   # between ResNet features and BiLSTM
+  dropout: 0.5            # after BiLSTM, in classification head
+  feature_dropout: 0.4   # between ResNet features and BiLSTM
 
 # Smoothing of split-step label
 smoothing:
   ema_alpha: 0.5           # EMA over per-frame split-step probability
-  prob_on: 0.35             # probability to flip to ON (must be sustained for min_on_frames)
-  prob_off: 0.25            # probability to flip back to OFF (must be sustained for cooldown_frames)
+  prob_on: 0.45             # probability to flip to ON (must be sustained for min_on_frames)
+  prob_off: 0.35            # probability to flip back to OFF (must be sustained for cooldown_frames)
   min_on_frames: 3         # minimum sustained frames to declare a split step
   cooldown_frames: 4        # minimum sustained low-prob frames to clear it
 
@@ -84,22 +85,39 @@ train_action:
   lr: 0.00005              # fallback when backbone_lr/head_lr omitted
   backbone_lr: 0.000003     # used when freeze_backbone=false (ResNet fine-tune)
   head_lr: 0.00005         # BiLSTM + linear head
-  weight_decay: 0.001
+  weight_decay: 0.01
   num_workers: 2
   val_split: 0.2
   loss: bce                # cross_entropy | bce
-  class_weight_balance: true  
+  class_weight_balance: false # event-balanced batches already rebalance positives
   label_smoothing: 0.05     # only used by cross_entropy
-  early_stopping_patience: 4
+  early_stopping_patience: 5
   early_stopping_metric: split_step_f1
   best_metric: split_step_f1       # checkpoint selection metric
   min_lr_ratio: 0.05          # cosine floor = lr * min_lr_ratio
-  max_pos_weight: 2.0         # cap BCE positive weight when class_weight_balance
+  max_pos_weight: 1.0         # unused while class_weight_balance=false
   grad_clip_norm: 1.0
   classification_threshold: 0.5  # fallback when best_metric is val_loss; otherwise per-epoch sweep
   threshold_sweep_min: 0.25
   threshold_sweep_max: 0.65
   threshold_sweep_step: 0.01
+  ema_decay: 0.999          # 0 disables EMA; validation/checkpoints use EMA weights
+  temperature_calibration: true # fit one logit temperature on val after training
+  event_balanced_sampling: true
+  event_positive_fraction: 0.25
+  event_boundary_negative_fraction: 0.25
+  event_boundary_radius_frames: 8
+  # Clip-consistent robustness augmentation (training only).
+  augmentation_bbox_translate: 0.05  # fraction of crop width/height
+  augmentation_bbox_scale_min: 0.9
+  augmentation_bbox_scale_max: 1.1
+  augmentation_blur_probability: 0.15
+  augmentation_blur_sigma_min: 0.1
+  augmentation_blur_sigma_max: 1.5
+  augmentation_jpeg_probability: 0.15
+  augmentation_jpeg_quality_min: 60
+  augmentation_jpeg_quality_max: 95
+  augmentation_frame_drop_probability: 0.05  # interior frame repeats; final frame preserved
   amp: true                # mixed precision when CUDA available
   output_dir: models/action_player  # overridden per run by train-action
 
@@ -121,9 +139,6 @@ cvat:
   player2_label: Player
   split_attribute: movement_state
   yolo_class_name: player
-  positive_label_ratio: 0.3  # hard-positive threshold for soft window labels
-  soft_transition_frames: 2   # soften N normal frames before/after each split-step motion
-  soft_transition_min: 0.2   # outer transition target; ramps up to 1.0 near motion
   centered_action_clips: false # keep causal trailing clips; true uses future context
   # Three-way split (train share is implicit: 1 - val_split - test_split).
   # Defaults give 60% train / 20% val / 20% test.

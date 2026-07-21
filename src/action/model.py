@@ -57,10 +57,16 @@ class SplitStepCNNLSTM(nn.Module):
         dropout: float = 0.2,
         feature_dropout: float = 0.25,
         freeze_backbone: bool = True,
+        freeze_batchnorm_stats: bool = False,
+        temperature: float = 1.0,
     ) -> None:
         super().__init__()
+        if temperature <= 0:
+            raise ValueError("temperature must be > 0.")
         self.backbone, feat_dim = _build_backbone(backbone_name)
         self.feat_dim = feat_dim
+        self.freeze_batchnorm_stats = bool(freeze_batchnorm_stats)
+        self.temperature = float(temperature)
         # Regularize CNN features before the temporal model (head dropout is separate).
         self.feature_dropout = nn.Dropout(feature_dropout)
         self.lstm = nn.LSTM(
@@ -87,15 +93,40 @@ class SplitStepCNNLSTM(nn.Module):
             "dropout": dropout,
             "feature_dropout": feature_dropout,
             "freeze_backbone": freeze_backbone,
+            "freeze_batchnorm_stats": self.freeze_batchnorm_stats,
+            "temperature": self.temperature,
         }
 
         self.apply_freeze_backbone(freeze_backbone)
+
+    def train(self, mode: bool = True) -> "SplitStepCNNLSTM":
+        """Set training mode while optionally keeping backbone BN stats fixed."""
+        super().train(mode)
+        if mode and self.freeze_batchnorm_stats:
+            for module in self.backbone.modules():
+                if isinstance(module, nn.modules.batchnorm._BatchNorm):
+                    module.eval()
+        return self
 
     def apply_freeze_backbone(self, freeze: bool) -> None:
         """Toggle backbone gradient flow and persist the choice in ``config``."""
         for p in self.backbone.parameters():
             p.requires_grad = not freeze
         self.config["freeze_backbone"] = bool(freeze)
+
+    def apply_freeze_batchnorm_stats(self, freeze: bool) -> None:
+        """Toggle automatic freezing of backbone BatchNorm running statistics."""
+        self.freeze_batchnorm_stats = bool(freeze)
+        self.config["freeze_batchnorm_stats"] = self.freeze_batchnorm_stats
+        if self.training:
+            self.train(True)
+
+    def set_temperature(self, temperature: float) -> None:
+        """Set positive post-training logit temperature."""
+        if temperature <= 0:
+            raise ValueError("temperature must be > 0.")
+        self.temperature = float(temperature)
+        self.config["temperature"] = self.temperature
 
     def try_load_imagenet_weights(self) -> bool:
         """Best-effort load of ImageNet weights for the backbone.
@@ -144,10 +175,17 @@ class SplitStepCNNLSTM(nn.Module):
         feats = self.backbone(clips.view(b * t, c, h, w))
         feats = feats.view(b, t, -1)
         feats = self.feature_dropout(feats)
-        out, _ = self.lstm(feats)
-        # Predict from the final timestep -> labels the most recent frame.
-        last = out[:, -1, :]
-        return self.head(last)
+        # EMA/deep-copied LSTM weights may not retain cuDNN's packed layout.
+        # This is a no-op once contiguous and avoids repacking on every call.
+        self.lstm.flatten_parameters()
+        _, (h_n, _) = self.lstm(feats)
+        if self.lstm.bidirectional:
+            # The last two states are the final forward/backward states of the
+            # last LSTM layer, so both summarize the complete trailing clip.
+            sequence_summary = torch.cat((h_n[-2], h_n[-1]), dim=-1)
+        else:
+            sequence_summary = h_n[-1]
+        return self.head(sequence_summary) / self.temperature
 
 
 def build_model(cfg: ActionConfig) -> SplitStepCNNLSTM:
@@ -161,6 +199,8 @@ def build_model(cfg: ActionConfig) -> SplitStepCNNLSTM:
         dropout=cfg.dropout,
         feature_dropout=cfg.feature_dropout,
         freeze_backbone=cfg.freeze_backbone,
+        freeze_batchnorm_stats=cfg.freeze_batchnorm_stats,
+        temperature=1.0,
     )
 
 
@@ -194,6 +234,8 @@ def load_checkpoint(
         dropout=cfg.get("dropout", 0.2),
         feature_dropout=cfg.get("feature_dropout", 0.0),
         freeze_backbone=cfg.get("freeze_backbone", True),
+        freeze_batchnorm_stats=cfg.get("freeze_batchnorm_stats", False),
+        temperature=cfg.get("temperature", 1.0),
     )
     model.load_state_dict(payload["model_state"])
     return model

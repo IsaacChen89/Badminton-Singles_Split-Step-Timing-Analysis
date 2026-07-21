@@ -639,9 +639,6 @@ def export_action_dataset(
     crop_size: int = 224,
     seed: int = 42,
     group_split: bool = True,
-    positive_label_ratio: float = 0.15,
-    soft_transition_frames: int = 3,
-    soft_transition_min: float = 0.25,
     centered_clips: bool = False,
 ) -> Path:
     """Export per-player crop clips for the action model.
@@ -649,11 +646,9 @@ def export_action_dataset(
     For each labeled frame ``f`` of a player track, we build a clip of
     ``clip_length`` frames. By default this is a trailing causal window
     (``f - clip_length + 1`` … ``f``). If ``centered_clips`` is true, the
-    window is centered around ``f``. The manifest stores both a hard ``label``
-    for metrics and a soft ``target`` for BCE training. The soft target is the
-    average action value among labeled frames in the clip window. Positive
-    motion frames stay at 1.0; nearby normal frames can be softened by
-    ``soft_transition_frames`` so boundary timing is not punished as harshly.
+    window is centered around ``f``. Both the metric ``label`` and BCE
+    ``target`` use the hard action annotation at frame ``f``. With the default
+    trailing window, this matches the model's final-timestep prediction.
 
     Clips are split three ways into ``train`` / ``val`` / ``test`` (the train
     share is implicit: ``1 - val_split - test_split``) and the chosen split
@@ -676,9 +671,6 @@ def export_action_dataset(
     total_clips = 0
     total_frames = 0
     total_skipped = 0
-    positive_label_ratio = max(0.0, min(1.0, float(positive_label_ratio)))
-    soft_transition_frames = max(0, int(soft_transition_frames))
-    soft_transition_min = max(0.0, min(1.0, float(soft_transition_min)))
     targets_by_stem: Dict[str, List[Tuple[int, int, int, float]]] = {}
     label_counts_by_stem: Dict[str, Dict[int, int]] = {}
 
@@ -703,17 +695,11 @@ def export_action_dataset(
                     continue
         targets: List[Tuple[int, int, int, float]] = []
         for pid, labels_by_frame in labels_by_pid.items():
-            soft_labels_by_frame = _soft_transition_labels(
-                labels_by_frame,
-                transition_frames=soft_transition_frames,
-                min_value=soft_transition_min,
-            )
             for frame, label in sorted(labels_by_frame.items()):
                 if (frame % max(1, clip_stride)) != 0:
                     continue
-                frames = _clip_frame_indices(frame, clip_length, centered=centered_clips)
-                target = _window_action_target(soft_labels_by_frame, frames, fallback=label)
-                hard_label = int(target >= positive_label_ratio)
+                hard_label = int(label)
+                target = float(hard_label)
                 targets.append((pid, frame, hard_label, target))
         if not targets:
             logger.warning(
@@ -891,70 +877,6 @@ def _clip_frame_indices(center: int, clip_length: int, *, centered: bool = False
     return [start + i for i in range(clip_length)]
 
 
-def _soft_transition_labels(
-    labels_by_frame: Dict[int, int],
-    *,
-    transition_frames: int,
-    min_value: float,
-) -> Dict[int, float]:
-    """Return per-frame soft targets with ramps around positive intervals.
-
-    Hard positive frames stay at 1.0. Labeled normal frames up to
-    ``transition_frames`` before/after a positive interval receive a linearly
-    tapered target from ``min_value`` at the outer edge to nearly 1.0 at the
-    interval boundary. Frames far from positives remain 0.0.
-    """
-    soft = {frame: float(int(label) == 1) for frame, label in labels_by_frame.items()}
-    if transition_frames <= 0 or not labels_by_frame:
-        return soft
-
-    positive_frames = sorted(frame for frame, label in labels_by_frame.items() if int(label) == 1)
-    if not positive_frames:
-        return soft
-
-    intervals: List[Tuple[int, int]] = []
-    start = positive_frames[0]
-    prev = positive_frames[0]
-    for frame in positive_frames[1:]:
-        if frame == prev + 1:
-            prev = frame
-            continue
-        intervals.append((start, prev))
-        start = frame
-        prev = frame
-    intervals.append((start, prev))
-
-    labeled_frames = set(labels_by_frame)
-    for start, end in intervals:
-        for offset in range(1, transition_frames + 1):
-            value = _transition_value(offset, transition_frames, min_value)
-            before = start - offset
-            after = end + offset
-            if before in labeled_frames and int(labels_by_frame[before]) == 0:
-                soft[before] = max(soft.get(before, 0.0), value)
-            if after in labeled_frames and int(labels_by_frame[after]) == 0:
-                soft[after] = max(soft.get(after, 0.0), value)
-    return soft
-
-
-def _transition_value(offset: int, transition_frames: int, min_value: float) -> float:
-    # offset=1 is closest to the motion interval and should be strongest.
-    strength = (transition_frames - offset + 1) / (transition_frames + 1)
-    return max(0.0, min(1.0, min_value + (1.0 - min_value) * strength))
-
-
-def _window_action_target(
-    labels_by_frame: Dict[int, float],
-    frame_indices: Sequence[int],
-    *,
-    fallback: int | float,
-) -> float:
-    labels = [labels_by_frame[f] for f in frame_indices if f in labels_by_frame]
-    if not labels:
-        return float(fallback)
-    return float(sum(labels) / len(labels))
-
-
 # -------------------------------------------------------------------- #
 # High-level convenience: do both YOLO and action in one call
 # -------------------------------------------------------------------- #
@@ -977,9 +899,6 @@ def convert_cvat(
     split_attribute: str = "split_step",
     seed: int = 42,
     group_split: bool = True,
-    positive_label_ratio: float = 0.15,
-    soft_transition_frames: int = 3,
-    soft_transition_min: float = 0.25,
     centered_action_clips: bool = False,
 ) -> Dict[str, Path]:
     """Run YOLO + action exports in one shot.
@@ -1021,9 +940,6 @@ def convert_cvat(
             crop_size=crop_size,
             seed=seed,
             group_split=group_split,
-            positive_label_ratio=positive_label_ratio,
-            soft_transition_frames=soft_transition_frames,
-            soft_transition_min=soft_transition_min,
             centered_clips=centered_action_clips,
         )
     return out

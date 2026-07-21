@@ -492,9 +492,6 @@ def convert_cvat(
         split_attribute=cfg.cvat.split_attribute,
         seed=cfg.seed,
         group_split=cfg.cvat.group_split and not no_group_split,
-        positive_label_ratio=cfg.cvat.positive_label_ratio,
-        soft_transition_frames=cfg.cvat.soft_transition_frames,
-        soft_transition_min=cfg.cvat.soft_transition_min,
         centered_action_clips=cfg.cvat.centered_action_clips,
     )
 
@@ -658,8 +655,17 @@ def train_action_cmd(
         "head_lr": cfg.train_action.head_lr,
         "weight_decay": cfg.train_action.weight_decay,
         "freeze_backbone": cfg.action.freeze_backbone,
+        "freeze_batchnorm_stats": cfg.action.freeze_batchnorm_stats,
         "loss": cfg.train_action.loss,
         "class_weight_balance": cfg.train_action.class_weight_balance,
+        "event_balanced_sampling": cfg.train_action.event_balanced_sampling,
+        "event_positive_fraction": cfg.train_action.event_positive_fraction,
+        "event_boundary_negative_fraction": (
+            cfg.train_action.event_boundary_negative_fraction
+        ),
+        "event_boundary_radius_frames": (
+            cfg.train_action.event_boundary_radius_frames
+        ),
         "manifest": project_relative(manifest),
         "best_val_f1": result.best_val_f1,
         "best_val_f1_kind": "macro_f1",
@@ -670,6 +676,10 @@ def train_action_cmd(
         "best_metric_value": result.best_metric_value,
         "early_stopping_metric": cfg.train_action.early_stopping_metric,
         "best_threshold": result.best_threshold,
+        "ema_decay": result.ema_decay,
+        "temperature": result.temperature,
+        "calibration_loss_before": result.calibration_loss_before,
+        "calibration_loss_after": result.calibration_loss_after,
         "test_f1": result.test_f1,
         "test_f1_kind": "macro_f1",
         "test_split_step_f1": result.test_split_step_f1,

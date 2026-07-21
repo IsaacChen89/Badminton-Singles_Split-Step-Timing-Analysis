@@ -12,11 +12,13 @@ import numpy as np
 import torch
 import torch.nn as nn
 from sklearn.metrics import classification_report, f1_score
+from torch.optim.swa_utils import AveragedModel
 from torch.utils.data import DataLoader
 
 from ..utils.config import ActionConfig, TrainActionConfig, device_supports_amp, device_supports_pin_memory
 from ..utils.logging import get_logger
 from .dataset import (
+    EventBalancedBatchSampler,
     SplitStepClipDataset,
     build_eval_transform,
     build_train_transform,
@@ -25,6 +27,24 @@ from .model import build_model, load_checkpoint, save_checkpoint
 from .plots import save_training_plots
 
 logger = get_logger("action.train")
+
+
+def _ema_multi_avg_fn(
+    configured_decay: float,
+):
+    """Return EMA update with a short bias-reducing warmup."""
+
+    def average(
+        averaged: list[torch.Tensor],
+        current: list[torch.Tensor],
+        num_averaged: torch.Tensor | int,
+    ) -> None:
+        updates = int(num_averaged)
+        warmup_decay = (updates + 1.0) / (updates + 10.0)
+        decay = min(configured_decay, warmup_decay)
+        torch._foreach_lerp_(averaged, current, 1.0 - decay)
+
+    return average
 
 
 @dataclass
@@ -44,6 +64,10 @@ class TrainResult:
     test_loss: Optional[float] = None
     test_report: Optional[dict] = None
     resumed_from: Optional[str] = None
+    ema_decay: Optional[float] = None
+    temperature: Optional[float] = None
+    calibration_loss_before: Optional[float] = None
+    calibration_loss_after: Optional[float] = None
 
 
 @dataclass
@@ -113,6 +137,86 @@ def collect_eval_outputs(
         probs=np.asarray(all_probs, dtype=np.float32),
         labels=np.asarray(all_labels, dtype=np.int64),
     )
+
+
+@torch.inference_mode()
+def _collect_calibration_logits(
+    model: nn.Module,
+    loader: DataLoader,
+    device: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Collect uncalibrated logits and hard labels on CPU."""
+    model.eval()
+    all_logits: list[torch.Tensor] = []
+    all_labels: list[torch.Tensor] = []
+    for clips, _targets, labels in loader:
+        clips = clips.to(device, non_blocking=True)
+        all_logits.append(model(clips).detach().cpu())
+        all_labels.append(labels.detach().cpu())
+    if not all_logits:
+        return torch.empty((0, 1)), torch.empty(0, dtype=torch.long)
+    return torch.cat(all_logits), torch.cat(all_labels)
+
+
+def fit_temperature(
+    model: nn.Module,
+    loader: DataLoader,
+    device: str,
+    *,
+    use_bce: bool,
+    max_steps: int = 200,
+) -> tuple[float, float, float]:
+    """Fit one positive temperature on hard validation labels."""
+    set_temperature = getattr(model, "set_temperature", None)
+    if not callable(set_temperature):
+        raise TypeError("Temperature calibration requires model.set_temperature().")
+    set_temperature(1.0)
+    logits, labels = _collect_calibration_logits(model, loader, device)
+    if labels.numel() == 0:
+        return 1.0, float("nan"), float("nan")
+    # Tensors created under inference_mode cannot participate in the scalar
+    # temperature optimization graph; clone them into ordinary CPU tensors.
+    logits = logits.clone()
+    labels = labels.clone()
+
+    if use_bce:
+        calibration_logits = _binary_logits(logits)
+        calibration_labels = labels.float()
+
+        def calibration_loss(scaled_logits: torch.Tensor) -> torch.Tensor:
+            return nn.functional.binary_cross_entropy_with_logits(
+                scaled_logits,
+                calibration_labels,
+            )
+
+    else:
+        calibration_logits = logits
+        calibration_labels = labels
+
+        def calibration_loss(scaled_logits: torch.Tensor) -> torch.Tensor:
+            return nn.functional.cross_entropy(scaled_logits, calibration_labels)
+
+    with torch.no_grad():
+        loss_before = float(calibration_loss(calibration_logits).item())
+
+    log_temperature = nn.Parameter(torch.zeros((), dtype=calibration_logits.dtype))
+    optimizer = torch.optim.Adam([log_temperature], lr=0.05)
+    for _ in range(max(1, int(max_steps))):
+        optimizer.zero_grad(set_to_none=True)
+        temperature = log_temperature.exp().clamp(0.05, 10.0)
+        loss = calibration_loss(calibration_logits / temperature)
+        loss.backward()
+        optimizer.step()
+        with torch.no_grad():
+            log_temperature.clamp_(math.log(0.05), math.log(10.0))
+
+    temperature_value = float(log_temperature.detach().exp().item())
+    with torch.no_grad():
+        loss_after = float(
+            calibration_loss(calibration_logits / temperature_value).item()
+        )
+    set_temperature(temperature_value)
+    return temperature_value, loss_before, loss_after
 
 
 def _metrics_from_probs(
@@ -444,7 +548,19 @@ def train(
         manifest_path=manifest,
         split="train",
         clip_length=action_cfg.clip_length,
-        transform=build_train_transform(action_cfg.input_size),
+        transform=build_train_transform(
+            action_cfg.input_size,
+            bbox_translate=train_cfg.augmentation_bbox_translate,
+            bbox_scale_min=train_cfg.augmentation_bbox_scale_min,
+            bbox_scale_max=train_cfg.augmentation_bbox_scale_max,
+            blur_probability=train_cfg.augmentation_blur_probability,
+            blur_sigma_min=train_cfg.augmentation_blur_sigma_min,
+            blur_sigma_max=train_cfg.augmentation_blur_sigma_max,
+            jpeg_probability=train_cfg.augmentation_jpeg_probability,
+            jpeg_quality_min=train_cfg.augmentation_jpeg_quality_min,
+            jpeg_quality_max=train_cfg.augmentation_jpeg_quality_max,
+            frame_drop_probability=train_cfg.augmentation_frame_drop_probability,
+        ),
     )
     val_ds = SplitStepClipDataset(
         manifest_path=manifest,
@@ -465,14 +581,42 @@ def train(
         f"|  Test clips: {len(test_ds)}"
     )
 
-    train_loader = DataLoader(
-        train_ds,
-        batch_size=train_cfg.batch_size,
-        shuffle=True,
-        num_workers=train_cfg.num_workers,
-        pin_memory=device_supports_pin_memory(device),
-        drop_last=False,
-    )
+    if train_cfg.event_balanced_sampling:
+        batch_sampler = EventBalancedBatchSampler(
+            train_ds.records,
+            train_cfg.batch_size,
+            positive_fraction=train_cfg.event_positive_fraction,
+            boundary_negative_fraction=train_cfg.event_boundary_negative_fraction,
+            event_gap_frames=max(1, int(action_cfg.clip_stride)),
+            boundary_radius_frames=train_cfg.event_boundary_radius_frames,
+            seed=seed,
+        )
+        train_loader = DataLoader(
+            train_ds,
+            batch_sampler=batch_sampler,
+            num_workers=train_cfg.num_workers,
+            pin_memory=device_supports_pin_memory(device),
+        )
+        logger.info(
+            f"Event-balanced sampling: {len(batch_sampler.positive_events)} events  |  "
+            f"positive={train_cfg.event_positive_fraction:.0%}  |  "
+            f"boundary-negative={train_cfg.event_boundary_negative_fraction:.0%}  |  "
+            f"radius={train_cfg.event_boundary_radius_frames} frames"
+        )
+        if train_cfg.class_weight_balance:
+            logger.warning(
+                "Event-balanced sampling and class_weight_balance are both enabled; "
+                "this can over-weight split-step clips and reduce precision."
+            )
+    else:
+        train_loader = DataLoader(
+            train_ds,
+            batch_size=train_cfg.batch_size,
+            shuffle=True,
+            num_workers=train_cfg.num_workers,
+            pin_memory=device_supports_pin_memory(device),
+            drop_last=False,
+        )
     val_loader = (
         DataLoader(
             val_ds,
@@ -504,10 +648,13 @@ def train(
         model = load_checkpoint(resume_path, map_location=device).to(device)
         _warn_checkpoint_config_mismatch(model, action_cfg)
         model.apply_freeze_backbone(action_cfg.freeze_backbone)
+        model.apply_freeze_batchnorm_stats(action_cfg.freeze_batchnorm_stats)
+        model.set_temperature(1.0)
         resumed_from = str(resume_path)
         n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
         logger.info(
             f"Resumed from {resume_path}  |  freeze_backbone={action_cfg.freeze_backbone}  "
+            f"|  freeze_batchnorm_stats={action_cfg.freeze_batchnorm_stats}  "
             f"|  trainable params={n_trainable:,}"
         )
     else:
@@ -549,6 +696,19 @@ def train(
 
     optimizer = _build_optimizer(model, action_cfg, train_cfg)
     scheduler = _build_scheduler(optimizer, train_cfg)
+    ema_decay = float(train_cfg.ema_decay)
+    if not 0.0 <= ema_decay < 1.0:
+        raise ValueError("train_action.ema_decay must satisfy 0 <= decay < 1.")
+    ema_model: Optional[AveragedModel] = None
+    if ema_decay > 0:
+        ema_model = AveragedModel(
+            model,
+            multi_avg_fn=_ema_multi_avg_fn(ema_decay),
+            use_buffers=False,
+        )
+        logger.info(
+            f"EMA model enabled: target decay={ema_decay:.6f} with warmup"
+        )
 
     use_amp = bool(train_cfg.amp and device_supports_amp(device))
     scaler = torch.amp.GradScaler("cuda") if use_amp else None
@@ -619,6 +779,8 @@ def train(
                 if grad_clip_norm > 0:
                     torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
                 optimizer.step()
+            if ema_model is not None:
+                ema_model.update_parameters(model)
             with torch.no_grad():
                 if use_bce:
                     preds = (torch.sigmoid(_binary_logits(logits)) >= 0.5).long()
@@ -642,8 +804,9 @@ def train(
         stop_score = float("nan")
         val_threshold = fallback_threshold
         if val_loader is not None:
+            eval_model = ema_model.module if ema_model is not None else model
             val_metrics = evaluate_with_threshold_sweep(
-                model,
+                eval_model,
                 val_loader,
                 criterion,
                 device,
@@ -688,7 +851,12 @@ def train(
             f"| split_f1 {val_split_f1:.3f} thr {val_threshold:.2f}"
         )
 
-        save_checkpoint(model, last_path, extra={"epoch": epoch})
+        checkpoint_model = ema_model.module if ema_model is not None else model
+        save_checkpoint(
+            checkpoint_model,
+            last_path,
+            extra={"epoch": epoch, "ema_decay": ema_decay},
+        )
         checkpoint_improved = _metric_improved(val_score, best_score, best_metric_name)
         if checkpoint_improved:
             best_score = val_score
@@ -698,7 +866,7 @@ def train(
             best_threshold = val_threshold
             best_epoch = epoch
             save_checkpoint(
-                model,
+                checkpoint_model,
                 best_path,
                 extra={
                     "epoch": epoch,
@@ -709,6 +877,7 @@ def train(
                     "best_metric": best_metric_name,
                     "best_metric_value": val_score,
                     "classification_threshold": best_threshold,
+                    "ema_decay": ema_decay,
                 },
             )
             logger.info(
@@ -732,7 +901,12 @@ def train(
 
     if best_epoch is None:
         # No validation set — keep "last" as best.
-        save_checkpoint(model, best_path, extra={"epoch": train_cfg.epochs})
+        checkpoint_model = ema_model.module if ema_model is not None else model
+        save_checkpoint(
+            checkpoint_model,
+            best_path,
+            extra={"epoch": train_cfg.epochs, "ema_decay": ema_decay},
+        )
         best_f1 = float("nan")
         best_acc = float("nan")
         best_split_step_f1 = float("nan")
@@ -753,6 +927,59 @@ def train(
                 f"Could not reload best checkpoint ({exc}); "
                 f"falling back to in-memory model."
             )
+
+    temperature: Optional[float] = None
+    calibration_loss_before: Optional[float] = None
+    calibration_loss_after: Optional[float] = None
+    if train_cfg.temperature_calibration and val_loader is not None:
+        temperature, calibration_loss_before, calibration_loss_after = fit_temperature(
+            best_model,
+            val_loader,
+            device,
+            use_bce=use_bce,
+        )
+        calibrated_val_metrics = evaluate_with_threshold_sweep(
+            best_model,
+            val_loader,
+            criterion,
+            device,
+            train_cfg,
+            use_bce=use_bce,
+            sweep_metric_name=best_metric_name,
+            fallback_threshold=fallback_threshold,
+        )
+        best_threshold = calibrated_val_metrics.threshold
+        best_f1 = calibrated_val_metrics.f1
+        best_acc = calibrated_val_metrics.acc
+        best_split_step_f1 = _class_report_metric(
+            calibrated_val_metrics.report,
+            "1",
+            "f1-score",
+        )
+        best_score = _select_metric(calibrated_val_metrics, best_metric_name)
+        save_checkpoint(
+            best_model,
+            best_path,
+            extra={
+                "epoch": best_epoch,
+                "val_f1": best_f1,
+                "val_acc": best_acc,
+                "val_loss": calibrated_val_metrics.loss,
+                "val_split_step_f1": best_split_step_f1,
+                "best_metric": best_metric_name,
+                "best_metric_value": best_score,
+                "classification_threshold": best_threshold,
+                "ema_decay": ema_decay,
+                "temperature": temperature,
+                "calibration_loss_before": calibration_loss_before,
+                "calibration_loss_after": calibration_loss_after,
+            },
+        )
+        logger.info(
+            f"Temperature calibration: T={temperature:.4f}  "
+            f"unweighted NLL {calibration_loss_before:.4f} -> "
+            f"{calibration_loss_after:.4f}  |  threshold={best_threshold:.2f}"
+        )
 
     test_acc: Optional[float] = None
     test_f1: Optional[float] = None
@@ -809,4 +1036,8 @@ def train(
         test_loss=test_loss,
         test_report=test_report,
         resumed_from=resumed_from,
+        ema_decay=ema_decay if ema_model is not None else None,
+        temperature=temperature,
+        calibration_loss_before=calibration_loss_before,
+        calibration_loss_after=calibration_loss_after,
     )

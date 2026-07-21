@@ -85,6 +85,7 @@ class ActionConfig:
     num_classes: int = 2
     backbone: str = "resnet18"
     freeze_backbone: bool = True
+    freeze_batchnorm_stats: bool = False
     lstm_hidden: int = 128
     lstm_layers: int = 1
     bidirectional: bool = True
@@ -124,6 +125,22 @@ class TrainActionConfig:
     threshold_sweep_min: float = 0.10
     threshold_sweep_max: float = 0.90
     threshold_sweep_step: float = 0.05
+    ema_decay: float = 0.0
+    temperature_calibration: bool = False
+    event_balanced_sampling: bool = False
+    event_positive_fraction: float = 0.35
+    event_boundary_negative_fraction: float = 0.25
+    event_boundary_radius_frames: int = 8
+    augmentation_bbox_translate: float = 0.05
+    augmentation_bbox_scale_min: float = 0.9
+    augmentation_bbox_scale_max: float = 1.1
+    augmentation_blur_probability: float = 0.15
+    augmentation_blur_sigma_min: float = 0.1
+    augmentation_blur_sigma_max: float = 1.5
+    augmentation_jpeg_probability: float = 0.15
+    augmentation_jpeg_quality_min: int = 60
+    augmentation_jpeg_quality_max: int = 95
+    augmentation_frame_drop_probability: float = 0.05
     amp: bool = True
     output_dir: str = "models/action_player"
 
@@ -144,9 +161,6 @@ class CvatConfig:
     player2_label: str = "player2"
     split_attribute: str = "split_step"
     yolo_class_name: str = "player"
-    positive_label_ratio: float = 0.15
-    soft_transition_frames: int = 3
-    soft_transition_min: float = 0.25
     centered_action_clips: bool = False
     # Three-way split: train share is implicit (1 - val_split - test_split).
     val_split: float = 0.2
