@@ -76,6 +76,8 @@ class ConsistentClipTrainTransform:
         jpeg_quality_max: int = 95,
         frame_drop_probability: float = 0.05,
     ) -> None:
+        if resize_margin < 0:
+            raise ValueError("resize_margin must be >= 0.")
         _validate_probability("horizontal_flip_p", horizontal_flip_p)
         _validate_probability("blur_probability", blur_probability)
         _validate_probability("jpeg_probability", jpeg_probability)
@@ -187,6 +189,11 @@ class PerFrameClipTransform:
 def build_train_transform(
     input_size: int = 224,
     *,
+    random_crop_margin: int = 16,
+    horizontal_flip_probability: float = 0.5,
+    brightness: float = 0.2,
+    contrast: float = 0.2,
+    saturation: float = 0.2,
     bbox_translate: float = 0.05,
     bbox_scale_min: float = 0.9,
     bbox_scale_max: float = 1.1,
@@ -200,6 +207,11 @@ def build_train_transform(
 ) -> ClipTransform:
     return ConsistentClipTrainTransform(
         input_size=input_size,
+        resize_margin=random_crop_margin,
+        horizontal_flip_p=horizontal_flip_probability,
+        brightness=brightness,
+        contrast=contrast,
+        saturation=saturation,
         bbox_translate=bbox_translate,
         bbox_scale_min=bbox_scale_min,
         bbox_scale_max=bbox_scale_max,
@@ -507,6 +519,9 @@ class SplitStepClipDataset(Dataset):
         Clip transform (``List[PIL.Image] -> torch.Tensor``). The training
         transform samples one crop/flip/color jitter and applies it to every
         frame in the clip.
+    frame_shift_max:
+        Randomly translate positive training clips by up to this many frames.
+        Vacated positions repeat the nearest edge frame.
     """
 
     def __init__(
@@ -516,13 +531,17 @@ class SplitStepClipDataset(Dataset):
         root: Optional[str | Path] = None,
         clip_length: int = 16,
         transform: Optional[ClipTransform] = None,
+        frame_shift_max: int = 0,
     ) -> None:
+        if frame_shift_max < 0:
+            raise ValueError("frame_shift_max must be >= 0.")
         self.manifest_path = Path(manifest_path)
         if not self.manifest_path.exists():
             raise FileNotFoundError(self.manifest_path)
         self.root = Path(root) if root is not None else self.manifest_path.parent
         self.clip_length = clip_length
         self.transform = transform or build_eval_transform()
+        self.frame_shift_max = int(frame_shift_max)
 
         df = pd.read_csv(self.manifest_path)
         df = df[df["split"] == split].reset_index(drop=True)
@@ -550,8 +569,8 @@ class SplitStepClipDataset(Dataset):
     def targets(self) -> np.ndarray:
         return np.array([r.target for r in self.records], dtype=np.float32)
 
-    def _load_clip(self, clip_id: str) -> torch.Tensor:
-        clip_dir = self.root / "clips" / clip_id
+    def _load_clip(self, record: ClipRecord) -> torch.Tensor:
+        clip_dir = self.root / "clips" / record.clip_id
         if not clip_dir.exists():
             raise FileNotFoundError(f"Clip directory missing: {clip_dir}")
         frame_paths = sorted(clip_dir.glob("*.jpg"))
@@ -569,10 +588,21 @@ class SplitStepClipDataset(Dataset):
         # Pad at the front by repeating the first frame if too short.
         while len(images) < self.clip_length:
             images.insert(0, images[0].copy())
+        if self.frame_shift_max > 0 and record.label == 1:
+            shift = random.randint(-self.frame_shift_max, self.frame_shift_max)
+            images = _shift_frames(images, shift)
         return self.transform(images)  # (T, 3, H, W)
 
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, int]:
         rec = self.records[idx]
-        clip = self._load_clip(rec.clip_id)
+        clip = self._load_clip(rec)
         target = torch.tensor(rec.target, dtype=torch.float32)
         return clip, target, rec.label
+
+
+def _shift_frames(images: List[Image.Image], shift: int) -> List[Image.Image]:
+    """Translate a clip in time, padding vacated positions at the edges."""
+    if shift == 0 or not images:
+        return images
+    last = len(images) - 1
+    return [images[min(last, max(0, index - shift))] for index in range(len(images))]

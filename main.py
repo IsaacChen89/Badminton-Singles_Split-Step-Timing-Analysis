@@ -666,6 +666,18 @@ def train_action_cmd(
         "event_boundary_radius_frames": (
             cfg.train_action.event_boundary_radius_frames
         ),
+        "augmentation_random_crop_margin": (
+            cfg.train_action.augmentation_random_crop_margin
+        ),
+        "augmentation_horizontal_flip_probability": (
+            cfg.train_action.augmentation_horizontal_flip_probability
+        ),
+        "augmentation_brightness": cfg.train_action.augmentation_brightness,
+        "augmentation_contrast": cfg.train_action.augmentation_contrast,
+        "augmentation_saturation": cfg.train_action.augmentation_saturation,
+        "augmentation_frame_shift_max": (
+            cfg.train_action.augmentation_frame_shift_max
+        ),
         "manifest": project_relative(manifest),
         "best_val_f1": result.best_val_f1,
         "best_val_f1_kind": "macro_f1",

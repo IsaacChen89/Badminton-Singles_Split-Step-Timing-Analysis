@@ -91,23 +91,28 @@ train_action:
   loss: bce                # cross_entropy | bce
   class_weight_balance: false # event-balanced batches already rebalance positives
   label_smoothing: 0.05     # only used by cross_entropy
-  early_stopping_patience: 5
+  early_stopping_patience: 4
   early_stopping_metric: split_step_f1
   best_metric: split_step_f1       # checkpoint selection metric
   min_lr_ratio: 0.05          # cosine floor = lr * min_lr_ratio
-  max_pos_weight: 1.0         # unused while class_weight_balance=false
+  max_pos_weight: 2.0         # unused while class_weight_balance=false
   grad_clip_norm: 1.0
   classification_threshold: 0.5  # fallback when best_metric is val_loss; otherwise per-epoch sweep
   threshold_sweep_min: 0.25
   threshold_sweep_max: 0.65
   threshold_sweep_step: 0.01
-  ema_decay: 0.999          # 0 disables EMA; validation/checkpoints use EMA weights
+  ema_decay: 0.995          # 0 disables EMA; validation/checkpoints use EMA weights
   temperature_calibration: true # fit one logit temperature on val after training
   event_balanced_sampling: true
-  event_positive_fraction: 0.25
+  event_positive_fraction: 0.20
   event_boundary_negative_fraction: 0.25
   event_boundary_radius_frames: 8
   # Clip-consistent robustness augmentation (training only).
+  augmentation_random_crop_margin: 16  # resize to input_size + margin, then random crop
+  augmentation_horizontal_flip_probability: 0.5
+  augmentation_brightness: 0.2
+  augmentation_contrast: 0.2
+  augmentation_saturation: 0.2
   augmentation_bbox_translate: 0.05  # fraction of crop width/height
   augmentation_bbox_scale_min: 0.9
   augmentation_bbox_scale_max: 1.1
@@ -118,6 +123,7 @@ train_action:
   augmentation_jpeg_quality_min: 60
   augmentation_jpeg_quality_max: 95
   augmentation_frame_drop_probability: 0.05  # interior frame repeats; final frame preserved
+  augmentation_frame_shift_max: 2  # positive clips only; random temporal shift in [-2, +2]
   amp: true                # mixed precision when CUDA available
   output_dir: models/action_player  # overridden per run by train-action
 

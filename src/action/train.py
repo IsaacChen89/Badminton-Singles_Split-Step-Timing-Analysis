@@ -550,6 +550,13 @@ def train(
         clip_length=action_cfg.clip_length,
         transform=build_train_transform(
             action_cfg.input_size,
+            random_crop_margin=train_cfg.augmentation_random_crop_margin,
+            horizontal_flip_probability=(
+                train_cfg.augmentation_horizontal_flip_probability
+            ),
+            brightness=train_cfg.augmentation_brightness,
+            contrast=train_cfg.augmentation_contrast,
+            saturation=train_cfg.augmentation_saturation,
             bbox_translate=train_cfg.augmentation_bbox_translate,
             bbox_scale_min=train_cfg.augmentation_bbox_scale_min,
             bbox_scale_max=train_cfg.augmentation_bbox_scale_max,
@@ -561,6 +568,7 @@ def train(
             jpeg_quality_max=train_cfg.augmentation_jpeg_quality_max,
             frame_drop_probability=train_cfg.augmentation_frame_drop_probability,
         ),
+        frame_shift_max=train_cfg.augmentation_frame_shift_max,
     )
     val_ds = SplitStepClipDataset(
         manifest_path=manifest,
