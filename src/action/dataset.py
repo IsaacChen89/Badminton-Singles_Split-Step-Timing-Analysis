@@ -2,10 +2,11 @@
 
 Manifest schema (CSV with header):
 
-    clip_id, video, player_id, center_frame, label, split
+    clip_id, video, player_id, center_frame, label, target, event_id, split
 
-``label`` is ``0`` (normal) or ``1`` (split_step). ``split`` is ``train``,
-``val``, or ``test``. The matching frame images live at::
+``label`` is ``0`` (normal) or ``1`` (split_step). Positive clips share an
+``event_id`` across one contiguous action. ``split`` is ``train``, ``val``,
+or ``test``. The matching frame images live at::
 
     <root>/clips/<clip_id>/<frame_idx>.jpg
 
@@ -300,6 +301,7 @@ class ClipRecord:
     center_frame: int
     label: int
     target: float
+    event_id: str
     split: SplitName
 
 
@@ -352,6 +354,7 @@ class EventBalancedBatchSampler(Sampler[List[int]]):
 
         self.positive_events: List[List[int]] = []
         positive_frames: dict[tuple[str, int], List[int]] = {}
+        events_by_id: dict[str, List[int]] = defaultdict(list)
         for key, indices in grouped.items():
             positive_indices = [
                 index for index in indices if self.records[index].label == 1
@@ -359,21 +362,12 @@ class EventBalancedBatchSampler(Sampler[List[int]]):
             positive_frames[key] = [
                 self.records[index].center_frame for index in positive_indices
             ]
-            current_event: List[int] = []
-            previous_frame: Optional[int] = None
             for index in positive_indices:
-                frame = self.records[index].center_frame
-                if (
-                    current_event
-                    and previous_frame is not None
-                    and frame - previous_frame > self.event_gap_frames
-                ):
-                    self.positive_events.append(current_event)
-                    current_event = []
-                current_event.append(index)
-                previous_frame = frame
-            if current_event:
-                self.positive_events.append(current_event)
+                event_id = self.records[index].event_id
+                if not event_id:
+                    raise ValueError("Positive clips require a non-empty event_id.")
+                events_by_id[event_id].append(index)
+        self.positive_events = list(events_by_id.values())
 
         boundary_by_video: dict[str, List[int]] = defaultdict(list)
         random_by_video: dict[str, List[int]] = defaultdict(list)
@@ -394,7 +388,9 @@ class EventBalancedBatchSampler(Sampler[List[int]]):
 
         self.boundary_by_video = dict(boundary_by_video)
         self.random_by_video = dict(random_by_video)
-        self.all_indices = list(range(len(self.records)))
+        self.negative_indices = [
+            index for index, record in enumerate(self.records) if record.label == 0
+        ]
 
     def __len__(self) -> int:
         if self.drop_last:
@@ -434,7 +430,9 @@ class EventBalancedBatchSampler(Sampler[List[int]]):
                 )
             )
             if len(batch) < size:
-                available = [index for index in self.all_indices if index not in used]
+                available = [
+                    index for index in self.negative_indices if index not in used
+                ]
                 rng.shuffle(available)
                 batch.extend(available[: size - len(batch)])
             rng.shuffle(batch)
@@ -448,15 +446,7 @@ class EventBalancedBatchSampler(Sampler[List[int]]):
     ) -> List[int]:
         if count <= 0 or not self.positive_events:
             return []
-        if count <= len(self.positive_events):
-            events = rng.sample(self.positive_events, count)
-        else:
-            events = list(self.positive_events)
-            events.extend(
-                rng.choice(self.positive_events)
-                for _ in range(count - len(self.positive_events))
-            )
-            rng.shuffle(events)
+        events = rng.sample(self.positive_events, min(count, len(self.positive_events)))
         selected: List[int] = []
         for event in events:
             candidates = [index for index in event if index not in used]
@@ -519,9 +509,9 @@ class SplitStepClipDataset(Dataset):
         Clip transform (``List[PIL.Image] -> torch.Tensor``). The training
         transform samples one crop/flip/color jitter and applies it to every
         frame in the clip.
-    frame_shift_max:
-        Randomly translate positive training clips by up to this many frames.
-        Vacated positions repeat the nearest edge frame.
+    boundary_soft_label_radius_frames:
+        Linearly soften BCE targets near hard-label transitions. Intended for
+        the training split only; labels used by metrics remain hard.
     """
 
     def __init__(
@@ -530,18 +520,20 @@ class SplitStepClipDataset(Dataset):
         split: SplitName = "train",
         root: Optional[str | Path] = None,
         clip_length: int = 16,
+        event_gap_frames: int = 4,
         transform: Optional[ClipTransform] = None,
-        frame_shift_max: int = 0,
+        boundary_soft_label_radius_frames: int = 0,
     ) -> None:
-        if frame_shift_max < 0:
-            raise ValueError("frame_shift_max must be >= 0.")
+        if event_gap_frames <= 0:
+            raise ValueError("event_gap_frames must be > 0.")
+        if boundary_soft_label_radius_frames < 0:
+            raise ValueError("boundary_soft_label_radius_frames must be >= 0.")
         self.manifest_path = Path(manifest_path)
         if not self.manifest_path.exists():
             raise FileNotFoundError(self.manifest_path)
         self.root = Path(root) if root is not None else self.manifest_path.parent
         self.clip_length = clip_length
         self.transform = transform or build_eval_transform()
-        self.frame_shift_max = int(frame_shift_max)
 
         df = pd.read_csv(self.manifest_path)
         df = df[df["split"] == split].reset_index(drop=True)
@@ -553,10 +545,16 @@ class SplitStepClipDataset(Dataset):
                 center_frame=int(r["center_frame"]),
                 label=int(r["label"]),
                 target=float(r["target"]) if "target" in df.columns else float(r["label"]),
+                event_id=_manifest_event_id(r.get("event_id", "")),
                 split=split,
             )
             for _, r in df.iterrows()
         ]
+        _assign_missing_event_ids(self.records, event_gap_frames)
+        self.soft_target_count = _apply_boundary_soft_targets(
+            self.records,
+            boundary_soft_label_radius_frames,
+        )
 
     def __len__(self) -> int:
         return len(self.records)
@@ -588,9 +586,6 @@ class SplitStepClipDataset(Dataset):
         # Pad at the front by repeating the first frame if too short.
         while len(images) < self.clip_length:
             images.insert(0, images[0].copy())
-        if self.frame_shift_max > 0 and record.label == 1:
-            shift = random.randint(-self.frame_shift_max, self.frame_shift_max)
-            images = _shift_frames(images, shift)
         return self.transform(images)  # (T, 3, H, W)
 
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, int]:
@@ -600,9 +595,92 @@ class SplitStepClipDataset(Dataset):
         return clip, target, rec.label
 
 
-def _shift_frames(images: List[Image.Image], shift: int) -> List[Image.Image]:
-    """Translate a clip in time, padding vacated positions at the edges."""
-    if shift == 0 or not images:
-        return images
-    last = len(images) - 1
-    return [images[min(last, max(0, index - shift))] for index in range(len(images))]
+def _manifest_event_id(value: object) -> str:
+    if value is None or pd.isna(value):
+        return ""
+    return str(value).strip()
+
+
+def _assign_missing_event_ids(
+    records: Sequence[ClipRecord],
+    event_gap_frames: int,
+) -> None:
+    """Backfill event IDs for manifests exported before event_id was added."""
+    grouped: dict[tuple[str, int], List[ClipRecord]] = defaultdict(list)
+    for record in records:
+        if record.label == 1:
+            grouped[(record.video, record.player_id)].append(record)
+
+    for (video, player_id), positives in grouped.items():
+        positives.sort(key=lambda record: record.center_frame)
+        segments: List[List[ClipRecord]] = []
+        current: List[ClipRecord] = []
+        previous_frame: Optional[int] = None
+        for record in positives:
+            if (
+                current
+                and previous_frame is not None
+                and record.center_frame - previous_frame > event_gap_frames
+            ):
+                segments.append(current)
+                current = []
+            current.append(record)
+            previous_frame = record.center_frame
+        if current:
+            segments.append(current)
+
+        for event_number, segment in enumerate(segments, start=1):
+            explicit_ids = {record.event_id for record in segment if record.event_id}
+            if len(explicit_ids) > 1:
+                raise ValueError(
+                    f"Positive segment has multiple event IDs: {sorted(explicit_ids)}"
+                )
+            event_id = next(iter(explicit_ids), "")
+            if not event_id:
+                event_id = f"{video}_p{player_id}_event{event_number:06d}"
+            for record in segment:
+                record.event_id = event_id
+
+
+def _apply_boundary_soft_targets(
+    records: Sequence[ClipRecord],
+    radius_frames: int,
+) -> int:
+    """Apply a linear 0↔1 target ramp around each hard-label transition."""
+    if radius_frames <= 0:
+        return 0
+    grouped: dict[tuple[str, int], List[ClipRecord]] = defaultdict(list)
+    for record in records:
+        grouped[(record.video, record.player_id)].append(record)
+
+    changed = 0
+    for samples in grouped.values():
+        samples.sort(key=lambda record: record.center_frame)
+        transitions: List[tuple[float, int, int]] = []
+        for left, right in zip(samples, samples[1:]):
+            if left.label != right.label:
+                transitions.append(
+                    (
+                        (left.center_frame + right.center_frame) / 2.0,
+                        left.label,
+                        right.label,
+                    )
+                )
+        for record in samples:
+            if not transitions:
+                continue
+            boundary, left_label, right_label = min(
+                transitions,
+                key=lambda transition: abs(record.center_frame - transition[0]),
+            )
+            if abs(record.center_frame - boundary) > radius_frames:
+                continue
+            progress = (
+                record.center_frame - (boundary - radius_frames)
+            ) / (2.0 * radius_frames)
+            progress = min(1.0, max(0.0, progress))
+            target = left_label + (right_label - left_label) * progress
+            if abs(target - record.target) > 1e-8:
+                record.target = float(target)
+                changed += 1
+    return changed

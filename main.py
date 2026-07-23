@@ -666,22 +666,17 @@ def train_action_cmd(
         "event_boundary_radius_frames": (
             cfg.train_action.event_boundary_radius_frames
         ),
-        "augmentation_random_crop_margin": (
-            cfg.train_action.augmentation_random_crop_margin
+        "event_match_tolerance_frames": (
+            cfg.train_action.event_match_tolerance_frames
         ),
-        "augmentation_horizontal_flip_probability": (
-            cfg.train_action.augmentation_horizontal_flip_probability
-        ),
-        "augmentation_brightness": cfg.train_action.augmentation_brightness,
-        "augmentation_contrast": cfg.train_action.augmentation_contrast,
-        "augmentation_saturation": cfg.train_action.augmentation_saturation,
-        "augmentation_frame_shift_max": (
-            cfg.train_action.augmentation_frame_shift_max
+        "boundary_soft_label_radius_frames": (
+            cfg.train_action.boundary_soft_label_radius_frames
         ),
         "manifest": project_relative(manifest),
         "best_val_f1": result.best_val_f1,
         "best_val_f1_kind": "macro_f1",
         "best_split_step_f1": result.best_split_step_f1,
+        "best_event_f1": result.best_event_f1,
         "best_val_acc": result.best_val_acc,
         "best_epoch": result.best_epoch,
         "best_metric": result.best_metric,
@@ -695,6 +690,7 @@ def train_action_cmd(
         "test_f1": result.test_f1,
         "test_f1_kind": "macro_f1",
         "test_split_step_f1": result.test_split_step_f1,
+        "test_event_f1": result.test_event_f1,
         "test_acc": result.test_acc,
         "checkpoint": project_relative(result.checkpoint_path),
     }

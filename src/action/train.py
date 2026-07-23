@@ -7,7 +7,7 @@ import math
 import random
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Sequence
 import numpy as np
 import torch
 import torch.nn as nn
@@ -18,11 +18,13 @@ from torch.utils.data import DataLoader
 from ..utils.config import ActionConfig, TrainActionConfig, device_supports_amp, device_supports_pin_memory
 from ..utils.logging import get_logger
 from .dataset import (
+    ClipRecord,
     EventBalancedBatchSampler,
     SplitStepClipDataset,
     build_eval_transform,
     build_train_transform,
 )
+from .event_metrics import EventMetrics, event_detection_metrics
 from .model import build_model, load_checkpoint, save_checkpoint
 from .plots import save_training_plots
 
@@ -58,9 +60,11 @@ class TrainResult:
     best_metric_value: Optional[float] = None
     best_threshold: Optional[float] = None
     best_split_step_f1: Optional[float] = None
+    best_event_f1: Optional[float] = None
     test_acc: Optional[float] = None
     test_f1: Optional[float] = None
     test_split_step_f1: Optional[float] = None
+    test_event_f1: Optional[float] = None
     test_loss: Optional[float] = None
     test_report: Optional[dict] = None
     resumed_from: Optional[str] = None
@@ -77,6 +81,7 @@ class EvalMetrics:
     f1: float
     report: dict = field(default_factory=dict)
     threshold: float = 0.5
+    event: Optional[EventMetrics] = None
 
     def to_dict(self) -> dict:
         return {
@@ -85,6 +90,7 @@ class EvalMetrics:
             "f1": self.f1,
             "threshold": self.threshold,
             "report": self.report,
+            "event": self.event.to_dict() if self.event is not None else None,
         }
 
 
@@ -93,6 +99,7 @@ class EvalOutputs:
     loss: float
     probs: np.ndarray
     labels: np.ndarray
+    records: Sequence[ClipRecord] = field(default_factory=list)
 
 
 @torch.inference_mode()
@@ -126,16 +133,21 @@ def collect_eval_outputs(
         all_probs.extend(probs.detach().cpu().tolist())
         all_labels.extend(labels.cpu().tolist())
     mean_loss = total_loss / max(1, total_n)
+    dataset_records = list(getattr(loader.dataset, "records", []))
+    if dataset_records and len(dataset_records) != total_n:
+        raise ValueError("Event metrics require evaluation in dataset record order.")
     if total_n == 0:
         return EvalOutputs(
             loss=float("nan"),
             probs=np.array([], dtype=np.float32),
             labels=np.array([], dtype=np.int64),
+            records=[],
         )
     return EvalOutputs(
         loss=mean_loss,
         probs=np.asarray(all_probs, dtype=np.float32),
         labels=np.asarray(all_labels, dtype=np.int64),
+        records=dataset_records,
     )
 
 
@@ -224,6 +236,10 @@ def _metrics_from_probs(
     labels: np.ndarray,
     threshold: float,
     loss: float = float("nan"),
+    *,
+    records: Sequence[ClipRecord] = (),
+    event_gap_frames: int = 4,
+    event_tolerance_frames: int = 4,
 ) -> EvalMetrics:
     if labels.size == 0:
         return EvalMetrics(loss=loss, acc=float("nan"), f1=float("nan"), threshold=threshold)
@@ -231,7 +247,24 @@ def _metrics_from_probs(
     acc = float(np.mean(preds == labels))
     f1 = f1_score(labels, preds, average="macro", zero_division=0)
     report = classification_report(labels, preds, output_dict=True, zero_division=0)
-    return EvalMetrics(loss=loss, acc=acc, f1=float(f1), report=report, threshold=threshold)
+    event = (
+        event_detection_metrics(
+            records,
+            preds,
+            event_gap_frames=event_gap_frames,
+            tolerance_frames=event_tolerance_frames,
+        )
+        if records
+        else None
+    )
+    return EvalMetrics(
+        loss=loss,
+        acc=acc,
+        f1=float(f1),
+        report=report,
+        threshold=threshold,
+        event=event,
+    )
 
 
 def _threshold_grid(train_cfg: TrainActionConfig) -> np.ndarray:
@@ -255,6 +288,8 @@ def _sweep_threshold(
     outputs: EvalOutputs,
     train_cfg: TrainActionConfig,
     best_metric_name: str,
+    *,
+    event_gap_frames: int,
 ) -> EvalMetrics:
     grid = _threshold_grid(train_cfg)
     best_metrics = _metrics_from_probs(
@@ -262,6 +297,9 @@ def _sweep_threshold(
         outputs.labels,
         threshold=float(grid[0]),
         loss=outputs.loss,
+        records=outputs.records,
+        event_gap_frames=event_gap_frames,
+        event_tolerance_frames=train_cfg.event_match_tolerance_frames,
     )
     best_score = _select_metric(best_metrics, best_metric_name)
     for threshold in grid[1:]:
@@ -270,6 +308,9 @@ def _sweep_threshold(
             outputs.labels,
             threshold=float(threshold),
             loss=outputs.loss,
+            records=outputs.records,
+            event_gap_frames=event_gap_frames,
+            event_tolerance_frames=train_cfg.event_match_tolerance_frames,
         )
         score = _select_metric(metrics, best_metric_name)
         if score > best_score:
@@ -286,12 +327,22 @@ def evaluate_model(
     device: str,
     use_bce: bool = False,
     threshold: float = 0.5,
+    event_gap_frames: int = 4,
+    event_tolerance_frames: int = 4,
 ) -> EvalMetrics:
     """Run a single forward pass over ``loader`` and compute eval metrics."""
     outputs = collect_eval_outputs(model, loader, criterion, device, use_bce=use_bce)
     if outputs.labels.size == 0:
         return EvalMetrics(loss=float("nan"), acc=float("nan"), f1=float("nan"))
-    return _metrics_from_probs(outputs.probs, outputs.labels, threshold, loss=outputs.loss)
+    return _metrics_from_probs(
+        outputs.probs,
+        outputs.labels,
+        threshold,
+        loss=outputs.loss,
+        records=outputs.records,
+        event_gap_frames=event_gap_frames,
+        event_tolerance_frames=event_tolerance_frames,
+    )
 
 
 @torch.inference_mode()
@@ -304,18 +355,27 @@ def evaluate_with_threshold_sweep(
     use_bce: bool = False,
     sweep_metric_name: str = "split_step_f1",
     fallback_threshold: float = 0.5,
+    event_gap_frames: int = 4,
 ) -> EvalMetrics:
     """Forward once, then pick the best classification threshold on val."""
     outputs = collect_eval_outputs(model, loader, criterion, device, use_bce=use_bce)
     if outputs.labels.size == 0:
         return EvalMetrics(loss=float("nan"), acc=float("nan"), f1=float("nan"))
     if _metric_uses_threshold(sweep_metric_name):
-        return _sweep_threshold(outputs, train_cfg, sweep_metric_name)
+        return _sweep_threshold(
+            outputs,
+            train_cfg,
+            sweep_metric_name,
+            event_gap_frames=event_gap_frames,
+        )
     return _metrics_from_probs(
         outputs.probs,
         outputs.labels,
         fallback_threshold,
         loss=outputs.loss,
+        records=outputs.records,
+        event_gap_frames=event_gap_frames,
+        event_tolerance_frames=train_cfg.event_match_tolerance_frames,
     )
 
 
@@ -380,11 +440,18 @@ def _select_metric(metrics: EvalMetrics, best_metric: str) -> float:
         return metrics.f1
     if normalized in {"acc", "accuracy", "val_acc"}:
         return metrics.acc
-    if normalized in {"split_step_f1", "class1_f1"}:
+    if normalized in {"split_clip_f1", "split_step_f1", "class1_f1"}:
         return _class_report_metric(metrics.report, "1", "f1-score")
+    if normalized in {
+        "split_event_f1",
+        "event_f1",
+        "split_step_event_f1",
+    }:
+        return metrics.event.f1 if metrics.event is not None else float("nan")
     raise ValueError(
         "Unsupported train_action metric "
-        f"'{best_metric}'. Use val_loss, macro_f1, accuracy, or split_step_f1."
+        f"'{best_metric}'. Use val_loss, macro_f1, accuracy, split_clip_f1, "
+        "or split_event_f1."
     )
 
 
@@ -543,11 +610,16 @@ def train(
         raise ValueError("BCE action training requires action.num_classes to be 1 or 2.")
     if not use_bce and action_cfg.num_classes < 2:
         raise ValueError("Cross-entropy action training requires action.num_classes >= 2.")
+    if train_cfg.event_match_tolerance_frames < 0:
+        raise ValueError("event_match_tolerance_frames must be >= 0.")
+    if train_cfg.boundary_soft_label_radius_frames > 0 and not use_bce:
+        raise ValueError("Boundary soft labels currently require BCE action training.")
 
     train_ds = SplitStepClipDataset(
         manifest_path=manifest,
         split="train",
         clip_length=action_cfg.clip_length,
+        event_gap_frames=max(1, int(action_cfg.clip_stride)),
         transform=build_train_transform(
             action_cfg.input_size,
             random_crop_margin=train_cfg.augmentation_random_crop_margin,
@@ -568,18 +640,22 @@ def train(
             jpeg_quality_max=train_cfg.augmentation_jpeg_quality_max,
             frame_drop_probability=train_cfg.augmentation_frame_drop_probability,
         ),
-        frame_shift_max=train_cfg.augmentation_frame_shift_max,
+        boundary_soft_label_radius_frames=(
+            train_cfg.boundary_soft_label_radius_frames
+        ),
     )
     val_ds = SplitStepClipDataset(
         manifest_path=manifest,
         split="val",
         clip_length=action_cfg.clip_length,
+        event_gap_frames=max(1, int(action_cfg.clip_stride)),
         transform=build_eval_transform(action_cfg.input_size),
     )
     test_ds = SplitStepClipDataset(
         manifest_path=manifest,
         split="test",
         clip_length=action_cfg.clip_length,
+        event_gap_frames=max(1, int(action_cfg.clip_stride)),
         transform=build_eval_transform(action_cfg.input_size),
     )
     if len(train_ds) == 0:
@@ -588,6 +664,11 @@ def train(
         f"Train clips: {len(train_ds)}  |  Val clips: {len(val_ds)}  "
         f"|  Test clips: {len(test_ds)}"
     )
+    if train_ds.soft_target_count:
+        logger.info(
+            f"Boundary soft labels: {train_ds.soft_target_count} train clips  |  "
+            f"radius={train_cfg.boundary_soft_label_radius_frames} frames"
+        )
 
     if train_cfg.event_balanced_sampling:
         batch_sampler = EventBalancedBatchSampler(
@@ -736,6 +817,7 @@ def train(
     best_f1 = -math.inf
     best_acc = 0.0
     best_split_step_f1 = float("nan")
+    best_event_f1 = float("nan")
     best_epoch: Optional[int] = None
     best_threshold = float(train_cfg.classification_threshold)
     fallback_threshold = float(train_cfg.classification_threshold)
@@ -808,6 +890,10 @@ def train(
         val_split_recall = float("nan")
         val_split_f1 = float("nan")
         val_split_support = 0.0
+        val_event_precision = float("nan")
+        val_event_recall = float("nan")
+        val_event_f1 = float("nan")
+        val_event_support = 0
         val_score = float("nan")
         stop_score = float("nan")
         val_threshold = fallback_threshold
@@ -822,6 +908,7 @@ def train(
                 use_bce=use_bce,
                 sweep_metric_name=best_metric_name,
                 fallback_threshold=fallback_threshold,
+                event_gap_frames=max(1, int(action_cfg.clip_stride)),
             )
             val_loss = val_metrics.loss
             val_acc = val_metrics.acc
@@ -831,6 +918,11 @@ def train(
             val_split_recall = _class_report_metric(val_metrics.report, "1", "recall")
             val_split_f1 = _class_report_metric(val_metrics.report, "1", "f1-score")
             val_split_support = _class_report_metric(val_metrics.report, "1", "support")
+            if val_metrics.event is not None:
+                val_event_precision = val_metrics.event.precision
+                val_event_recall = val_metrics.event.recall
+                val_event_f1 = val_metrics.event.f1
+                val_event_support = val_metrics.event.ground_truth_events
             val_score = _select_metric(val_metrics, best_metric_name)
             stop_score = _select_metric(val_metrics, stop_metric_name)
 
@@ -846,6 +938,10 @@ def train(
             "val_split_step_recall": val_split_recall,
             "val_split_step_f1": val_split_f1,
             "val_split_step_support": val_split_support,
+            "val_event_precision": val_event_precision,
+            "val_event_recall": val_event_recall,
+            "val_event_f1": val_event_f1,
+            "val_event_support": val_event_support,
             "val_best_metric": best_metric_name,
             "val_best_metric_value": val_score,
             "val_stop_metric": stop_metric_name,
@@ -856,7 +952,9 @@ def train(
         logger.info(
             f"epoch {epoch:03d} | train_loss {train_loss:.4f} acc {train_acc:.3f} "
             f"| val_loss {val_loss:.4f} acc {val_acc:.3f} f1 {val_f1:.3f} "
-            f"| split_f1 {val_split_f1:.3f} thr {val_threshold:.2f}"
+            f"| split_clip_f1 {val_split_f1:.3f} "
+            f"split_event_f1 {val_event_f1:.3f} "
+            f"thr {val_threshold:.2f}"
         )
 
         checkpoint_model = ema_model.module if ema_model is not None else model
@@ -871,6 +969,7 @@ def train(
             best_f1 = val_f1
             best_acc = val_acc
             best_split_step_f1 = val_split_f1
+            best_event_f1 = val_event_f1
             best_threshold = val_threshold
             best_epoch = epoch
             save_checkpoint(
@@ -882,6 +981,7 @@ def train(
                     "val_acc": val_acc,
                     "val_loss": val_loss,
                     "val_split_step_f1": val_split_f1,
+                    "val_event_f1": val_event_f1,
                     "best_metric": best_metric_name,
                     "best_metric_value": val_score,
                     "classification_threshold": best_threshold,
@@ -918,6 +1018,7 @@ def train(
         best_f1 = float("nan")
         best_acc = float("nan")
         best_split_step_f1 = float("nan")
+        best_event_f1 = float("nan")
         best_score = float("nan")
 
     (out_dir / "train_history.json").write_text(json.dumps(history, indent=2))
@@ -955,6 +1056,7 @@ def train(
             use_bce=use_bce,
             sweep_metric_name=best_metric_name,
             fallback_threshold=fallback_threshold,
+            event_gap_frames=max(1, int(action_cfg.clip_stride)),
         )
         best_threshold = calibrated_val_metrics.threshold
         best_f1 = calibrated_val_metrics.f1
@@ -963,6 +1065,11 @@ def train(
             calibrated_val_metrics.report,
             "1",
             "f1-score",
+        )
+        best_event_f1 = (
+            calibrated_val_metrics.event.f1
+            if calibrated_val_metrics.event is not None
+            else float("nan")
         )
         best_score = _select_metric(calibrated_val_metrics, best_metric_name)
         save_checkpoint(
@@ -974,6 +1081,7 @@ def train(
                 "val_acc": best_acc,
                 "val_loss": calibrated_val_metrics.loss,
                 "val_split_step_f1": best_split_step_f1,
+                "val_event_f1": best_event_f1,
                 "best_metric": best_metric_name,
                 "best_metric_value": best_score,
                 "classification_threshold": best_threshold,
@@ -992,6 +1100,7 @@ def train(
     test_acc: Optional[float] = None
     test_f1: Optional[float] = None
     test_split_step_f1: Optional[float] = None
+    test_event_f1: Optional[float] = None
     test_loss: Optional[float] = None
     test_report: Optional[dict] = None
     if test_loader is not None:
@@ -1003,6 +1112,8 @@ def train(
             device,
             use_bce=use_bce,
             threshold=best_threshold,
+            event_gap_frames=max(1, int(action_cfg.clip_stride)),
+            event_tolerance_frames=train_cfg.event_match_tolerance_frames,
         )
         test_loss = test_metrics.loss
         test_acc = test_metrics.acc
@@ -1010,9 +1121,15 @@ def train(
         test_report = test_metrics.report
         test_split_f1 = _class_report_metric(test_metrics.report, "1", "f1-score")
         test_split_step_f1 = test_split_f1
+        test_event_f1 = (
+            test_metrics.event.f1 if test_metrics.event is not None else None
+        )
         logger.info(
             f"Test  | loss {test_loss:.4f}  acc {test_acc:.3f}  f1 {test_f1:.3f} "
-            f"| split_f1 {test_split_f1:.3f}  thr {best_threshold:.2f}"
+            f"| split_clip_f1 {test_split_f1:.3f}  "
+            f"split_event_f1 "
+            f"{test_event_f1 if test_event_f1 is not None else float('nan'):.3f} "
+            f"thr {best_threshold:.2f}"
         )
         (out_dir / "test_metrics.json").write_text(
             json.dumps(test_metrics.to_dict(), indent=2)
@@ -1038,9 +1155,11 @@ def train(
         best_metric_value=None if math.isnan(best_score) else best_score,
         best_threshold=best_threshold,
         best_split_step_f1=None if math.isnan(best_split_step_f1) else best_split_step_f1,
+        best_event_f1=None if math.isnan(best_event_f1) else best_event_f1,
         test_acc=test_acc,
         test_f1=test_f1,
         test_split_step_f1=test_split_step_f1,
+        test_event_f1=test_event_f1,
         test_loss=test_loss,
         test_report=test_report,
         resumed_from=resumed_from,

@@ -131,6 +131,8 @@ class TrainActionConfig:
     event_positive_fraction: float = 0.35
     event_boundary_negative_fraction: float = 0.25
     event_boundary_radius_frames: int = 8
+    event_match_tolerance_frames: int = 4
+    boundary_soft_label_radius_frames: int = 0
     augmentation_random_crop_margin: int = 16
     augmentation_horizontal_flip_probability: float = 0.5
     augmentation_brightness: float = 0.2
@@ -146,7 +148,6 @@ class TrainActionConfig:
     augmentation_jpeg_quality_min: int = 60
     augmentation_jpeg_quality_max: int = 95
     augmentation_frame_drop_probability: float = 0.05
-    augmentation_frame_shift_max: int = 0
     amp: bool = True
     output_dir: str = "models/action_player"
 

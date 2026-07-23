@@ -15,7 +15,7 @@ training pipelines:
    ``split_step`` attribute. Output layout::
 
        <out>/
-         manifest.csv          # clip_id, video, player_id, center_frame, label, split
+         manifest.csv          # clips, labels, event IDs, and data split
          clips/<clip_id>/<frame_idx>.jpg ...
 
 Inputs
@@ -733,6 +733,11 @@ def export_action_dataset(
         targets = targets_by_stem.get(stem, [])
         if not targets:
             continue
+        event_ids = _positive_event_ids(
+            targets,
+            stem,
+            max_gap_frames=max(1, clip_stride),
+        )
         total_clips += len(targets)
 
         track_boxes: Dict[int, Dict[int, CvatBox]] = {}
@@ -781,6 +786,7 @@ def export_action_dataset(
                     "center_frame": str(center),
                     "label": str(label),
                     "target": f"{target:.6f}",
+                    "event_id": event_ids.get((pid, center), ""),
                     "split": split,
                 }
             )
@@ -840,6 +846,7 @@ def export_action_dataset(
                 "center_frame",
                 "label",
                 "target",
+                "event_id",
                 "split",
             ],
         )
@@ -851,6 +858,32 @@ def export_action_dataset(
         f"{total_frames} frames written, {total_skipped} skipped -> {output_dir}"
     )
     return manifest_path
+
+
+def _positive_event_ids(
+    targets: Sequence[Tuple[int, int, int, float]],
+    video: str,
+    *,
+    max_gap_frames: int,
+) -> Dict[Tuple[int, int], str]:
+    """Assign stable IDs to contiguous positive segments for each player."""
+    by_player: Dict[int, List[Tuple[int, int]]] = {}
+    for player_id, frame, label, _target in targets:
+        if label == 1:
+            by_player.setdefault(player_id, []).append((frame, label))
+
+    event_ids: Dict[Tuple[int, int], str] = {}
+    for player_id, positives in by_player.items():
+        event_number = 0
+        previous_frame: Optional[int] = None
+        for frame, _label in sorted(positives):
+            if previous_frame is None or frame - previous_frame > max_gap_frames:
+                event_number += 1
+            event_ids[(player_id, frame)] = (
+                f"{video}_p{player_id}_event{event_number:06d}"
+            )
+            previous_frame = frame
+    return event_ids
 
 
 def _nearest_box(per_frame: Dict[int, CvatBox], frame_idx: int) -> Optional[CvatBox]:
