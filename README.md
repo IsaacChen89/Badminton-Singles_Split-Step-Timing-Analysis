@@ -391,19 +391,21 @@ python main.py train-action --manifest data/action/manifest.csv --resume-run 1 -
 ### Highlights
 
 - ResNet18 → BiLSTM → linear head. Set `action.num_classes: 1` with `train_action.loss: bce` (default), or `num_classes: 2` with `cross_entropy`.
-- `action.freeze_backbone: false` (default) fine-tunes the CNN; set `true` for head-only training (stage 1 in a two-stage schedule).
+- `action.freeze_backbone: false` (default) fine-tunes the CNN; set `true` for head-only training.
 - `action.freeze_batchnorm_stats: true` keeps pretrained backbone BatchNorm running statistics fixed during fine-tuning while convolution and BatchNorm affine parameters remain trainable.
 - Differential learning rates when the backbone is unfrozen: `train_action.backbone_lr` and `train_action.head_lr` (fall back to `lr` when omitted). AdamW uses separate param groups; cosine decay applies per group.
 - BCE trains on `target` values from the manifest; metrics use `label`. They are aligned hard final-frame labels. Class weights are optional (`class_weight_balance`); BCE `pos_weight` is capped by `max_pos_weight`.
+- `boundary_soft_label_radius_frames` optionally replaces training BCE targets near each action start/end with a linear 0↔1 ramp. Validation/test loss and all metrics continue to use hard targets and labels.
 - AdamW, per-epoch cosine LR (`min_lr_ratio`), gradient clipping (`grad_clip_norm`), optional AMP on CUDA.
 - Optional EMA weights (`ema_decay`) use a short bias-reducing warmup, update after each optimizer step, and are used for validation and saved checkpoints.
 - Optional post-training temperature calibration fits one scalar on hard validation labels, stores it in the checkpoint, and re-sweeps the validation threshold before test evaluation.
 - Optional event-balanced sampling draws positives uniformly from contiguous split-step events, combines them with nearby boundary negatives and video-balanced random negatives, and avoids double-weighting when class weights are disabled.
-- Each validation epoch sweeps `threshold_sweep_*` on val to pick the best threshold for `best_metric` (default `split_step_f1`); `classification_threshold` is only a fallback when the checkpoint metric is val loss.
-- `best_metric` picks the checkpoint (default `split_step_f1`); `early_stopping_metric` controls early stopping (default `split_step_f1` in current `config.yaml`).
-- Training augmentation is sampled once per clip so spatial and appearance changes do not flicker between frames. `augmentation_*` settings control random-crop margin, horizontal-flip probability, brightness/contrast/saturation jitter, detector-box translation/scale error, blur, JPEG compression, dropped interior frames, and edge-padded temporal shifts of positive clips. The final frame is never dropped by frame-drop augmentation because it owns the causal clip label.
+- Action manifests store an explicit `event_id` for each contiguous positive segment. Event-balanced batches select at most one clip per event, and validation/test report event precision, recall, and F1 by matching predicted segments to ground truth with `event_match_tolerance_frames`.
+- Each validation epoch sweeps `threshold_sweep_*` on val to pick the best threshold for `best_metric` (currently `split_event_f1`); `classification_threshold` is only a fallback when the checkpoint metric is val loss.
+- `best_metric` picks the checkpoint and `early_stopping_metric` controls early stopping. Use `split_event_f1` for event detection or `split_clip_f1` for strict frame timing.
+- Training augmentation is sampled once per clip so spatial and appearance changes do not flicker between frames. `augmentation_*` settings control random-crop margin, horizontal-flip probability, brightness/contrast/saturation jitter, detector-box translation/scale error, blur, JPEG compression, and dropped interior frames. The final frame is never dropped by frame-drop augmentation because it owns the causal clip label.
 - Each run → `models/action_player_<N>/` with `action_best.pt`, `action_last.pt`, `train_history.json`, `run_info.json`, `training_curves.png`, `test_metrics.json`, and `test_class_metrics.png` when a test split exists.
-- `run_info.json` records hyperparameters, backbone/BatchNorm freezing, EMA decay, calibrated temperature/loss, `best_split_step_f1`, `test_split_step_f1`, `best_threshold`, and `resumed_from` when applicable.
+- `run_info.json` records hyperparameters, backbone/BatchNorm freezing, EMA decay, calibrated temperature/loss, clip/event split-step F1, `best_threshold`, and `resumed_from` when applicable.
 - Re-generate plots: `python main.py plot-training --action-run 1`.
 
 ### Inference tuning
