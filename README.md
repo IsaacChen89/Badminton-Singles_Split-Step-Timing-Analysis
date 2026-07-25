@@ -75,7 +75,8 @@ badminton-splitstep-analyzer/
 │   │   └── video_io.py
 │   ├── utils/                      # config, logging, geometry
 │   └── visualization/              # bounding boxes, SPLIT STEP labels, HUD
-├── models/                         # checkpoints (gitignored)
+├── models/                         # runtime checkpoints (gitignored)
+├── trained_models/                 # release checkpoints (move into models/ after clone)
 ├── data/                           # raw videos, CVAT exports, derived datasets
 ├── outputs/                        # annotated MP4s
 └── scripts/                        # thin wrappers around main.py sub-commands
@@ -94,10 +95,7 @@ pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
-CUDA is optional but recommended on Linux/Windows. On Apple Silicon, `device:
-auto` picks **MPS** (Metal GPU) when available. The CLI auto-detects the best backend (`device: auto` in `config.yaml`).
-
-To pre-download the stock YOLO checkpoint into `./models/`:
+To download the stock YOLO checkpoint into `./models/`:
 
 ```bash
 python scripts/download_yolo_weights.py            # -> models/yolo26n.pt
@@ -111,6 +109,23 @@ python main.py info
 ```
 
 If you see `ModuleNotFoundError: No module named 'torch'`, activate `.venv` first.
+
+### Trained models
+
+Release checkpoints under `trained_models/`. The pipeline loads versioned runs from `models/`, so copy (or move) them after install:
+
+```bash
+mkdir -p models
+cp -R trained_models/yolo_player_1 models/
+cp -R trained_models/action_player_1 models/
+```
+
+After that you can run inference with `--yolo-run 1` and `--action-run 1` (see [Run inference](#run-inference)).
+
+| Folder | Checkpoint used by analyze |
+| ------ | -------------------------- |
+| `models/yolo_player_1/` | `weights/best.pt` |
+| `models/action_player_1/` | `action_best.pt` |
 
 ---
 
@@ -367,9 +382,9 @@ python main.py train-yolo \
   --batch 32
 ```
 
-Each run is saved under an auto-incremented folder: `models/yolo_player_1/`, `models/yolo_player_2/`, … (`weights/best.pt`, promoted `yolo_player_best.pt`, Ultralytics plots, `args.yaml`). Gaps are preserved (if `_1` and `_3` exist, the next run is `_4`).
+Each run is saved under an auto-incremented folder: `models/yolo_player_1/`, `models/yolo_player_2/`, … (`weights/best.pt`, Ultralytics plots, `args.yaml`). Gaps are preserved (if `_1` and `_3` exist, the next run is `_4`).
 
-After training, pick a checkpoint with `--yolo-run N` in `analyze`, or pass `--yolo-weights models/yolo_player_<N>/yolo_player_best.pt`.
+After training, pick a checkpoint with `--yolo-run N` in `analyze`, or pass `--yolo-weights models/yolo_player_<N>/weights/best.pt`.
 
 ---
 
@@ -378,7 +393,7 @@ After training, pick a checkpoint with `--yolo-run N` in `analyze`, or pass `--y
 ```bash
 python main.py train-action \
   --manifest data/action/manifest.csv \
-  --epochs 30 \
+  --epochs 20 \
   --batch-size 32
 ```
 
@@ -391,7 +406,8 @@ python main.py train-action --manifest data/action/manifest.csv --resume-run 1 -
 ### Highlights
 
 - ResNet18 → BiLSTM → linear head. Set `action.num_classes: 1` with `train_action.loss: bce` (default), or `num_classes: 2` with `cross_entropy`.
-- `action.freeze_backbone: false` (default) fine-tunes the CNN; set `true` for head-only training.
+- New `train-action` runs load **ImageNet** backbone weights by default (best-effort). Pass `--no-pretrained` to skip that and train the backbone from random init. Resume (`--resume-run` / `--resume`) loads the checkpoint instead and does not re-fetch ImageNet weights.
+- `action.freeze_backbone: false` (default) trains the CNN; set `true` for head-only training. With a ResNet, `action.freeze_backbone_stages` can freeze early stages such as `[conv1, layer1, layer2]` while `layer3`/`layer4` and the temporal head remain trainable (`conv1` also freezes `bn1`). Freezing the full backbone or selected stages requires ImageNet weights (do not combine with `--no-pretrained`).
 - `action.freeze_batchnorm_stats: true` keeps pretrained backbone BatchNorm running statistics fixed during fine-tuning while convolution and BatchNorm affine parameters remain trainable.
 - Differential learning rates when the backbone is unfrozen: `train_action.backbone_lr` and `train_action.head_lr` (fall back to `lr` when omitted). AdamW uses separate param groups; cosine decay applies per group.
 - BCE trains on `target` values from the manifest; metrics use `label`. They are aligned hard final-frame labels. Class weights are optional (`class_weight_balance`); BCE `pos_weight` is capped by `max_pos_weight`.
@@ -401,8 +417,8 @@ python main.py train-action --manifest data/action/manifest.csv --resume-run 1 -
 - Optional post-training temperature calibration fits one scalar on hard validation labels, stores it in the checkpoint, and re-sweeps the validation threshold before test evaluation.
 - Optional event-balanced sampling draws positives uniformly from contiguous split-step events, combines them with nearby boundary negatives and video-balanced random negatives, and avoids double-weighting when class weights are disabled.
 - Action manifests store an explicit `event_id` for each contiguous positive segment. Event-balanced batches select at most one clip per event, and validation/test report event precision, recall, and F1 by matching predicted segments to ground truth with `event_match_tolerance_frames`.
-- Each validation epoch sweeps `threshold_sweep_*` on val to pick the best threshold for `best_metric` (currently `split_event_f1`); `classification_threshold` is only a fallback when the checkpoint metric is val loss.
-- `best_metric` picks the checkpoint and `early_stopping_metric` controls early stopping. Use `split_event_f1` for event detection or `split_clip_f1` for strict frame timing.
+- Each validation epoch sweeps `threshold_sweep_*` on val to pick the best threshold for `best_metric` (currently `split_step_event_f1`); `classification_threshold` is only a fallback when the checkpoint metric is val loss.
+- `best_metric` picks the checkpoint and `early_stopping_metric` controls early stopping. Use `split_step_event_f1` for event detection or `split_step_clip_f1` for strict frame timing. `min_delta` is the minimum improvement required to update the best checkpoint and reset early-stopping patience.
 - Training augmentation is sampled once per clip so spatial and appearance changes do not flicker between frames. `augmentation_*` settings control random-crop margin, horizontal-flip probability, brightness/contrast/saturation jitter, detector-box translation/scale error, blur, JPEG compression, and dropped interior frames. The final frame is never dropped by frame-drop augmentation because it owns the causal clip label.
 - Each run → `models/action_player_<N>/` with `action_best.pt`, `action_last.pt`, `train_history.json`, `run_info.json`, `training_curves.png`, `test_metrics.json`, and `test_class_metrics.png` when a test split exists.
 - `run_info.json` records hyperparameters, backbone/BatchNorm freezing, EMA decay, calibrated temperature/loss, clip/event split-step F1, `best_threshold`, and `resumed_from` when applicable.
@@ -426,7 +442,7 @@ See `action:`, `train_action:`, and `smoothing:` in `config.yaml` for all knobs.
   filter, `max_det`
 - `tracking` — `tracker_yaml` (`botsort.yaml` | `bytetrack.yaml`)
 - `assignment` — `top_is_player1`, `reassign_after_lost_frames`
-- `action` — backbone, `clip_length` / `clip_stride` (stride used at **convert-cvat** time), `num_classes`, LSTM size, `freeze_backbone`, `freeze_batchnorm_stats`, `dropout`, `feature_dropout`
+- `action` — backbone, `clip_length` / `clip_stride` (stride used at **convert-cvat** time), `num_classes`, LSTM size, `freeze_backbone`, `freeze_backbone_stages`, `freeze_batchnorm_stats`, `dropout`, `feature_dropout`
 - `smoothing` — EMA `α`, hysteresis `prob_on` / `prob_off`, `min_on_frames`, `cooldown_frames` (inference only)
 - `train_action` — hyperparameters (`loss`, `lr`, `backbone_lr`, `head_lr`, `best_metric`, `early_stopping_metric`, threshold sweep, EMA, temperature calibration, event-balanced sampling, class weights, `max_pos_weight`) and training-only `augmentation_*` controls
 - `train_yolo` — `base_model`, `epochs`, `imgsz`, `batch` (runs write to `models/yolo_player_<N>/`)
