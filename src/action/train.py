@@ -440,31 +440,33 @@ def _select_metric(metrics: EvalMetrics, best_metric: str) -> float:
         return metrics.f1
     if normalized in {"acc", "accuracy", "val_acc"}:
         return metrics.acc
-    if normalized in {"split_clip_f1", "split_step_f1", "class1_f1"}:
+    if normalized in {"split_step_clip_f1", "split_step_f1", "class1_f1"}:
         return _class_report_metric(metrics.report, "1", "f1-score")
-    if normalized in {
-        "split_event_f1",
-        "event_f1",
-        "split_step_event_f1",
-    }:
+    if normalized in {"split_step_event_f1", "event_f1"}:
         return metrics.event.f1 if metrics.event is not None else float("nan")
     raise ValueError(
         "Unsupported train_action metric "
-        f"'{best_metric}'. Use val_loss, macro_f1, accuracy, split_clip_f1, "
-        "or split_event_f1."
+        f"'{best_metric}'. Use val_loss, macro_f1, accuracy, split_step_clip_f1, "
+        "or split_step_event_f1."
     )
 
 
-def _metric_improved(current: float, best: float, metric_name: str) -> bool:
+def _metric_improved(
+    current: float,
+    best: float,
+    metric_name: str,
+    min_delta: float = 0.0,
+) -> bool:
     if math.isnan(current):
         return False
     if math.isinf(best) and best < 0:
         return True
     if math.isnan(best):
         return True
+    delta = max(0.0, float(min_delta))
     if _metric_higher_is_better(metric_name):
-        return current > best
-    return current < best
+        return current > best + delta
+    return current < best - delta
 
 
 def _effective_head_lr(train_cfg: TrainActionConfig) -> float:
@@ -737,12 +739,14 @@ def train(
         model = load_checkpoint(resume_path, map_location=device).to(device)
         _warn_checkpoint_config_mismatch(model, action_cfg)
         model.apply_freeze_backbone(action_cfg.freeze_backbone)
+        model.apply_freeze_backbone_stages(action_cfg.freeze_backbone_stages)
         model.apply_freeze_batchnorm_stats(action_cfg.freeze_batchnorm_stats)
         model.set_temperature(1.0)
         resumed_from = str(resume_path)
         n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
         logger.info(
             f"Resumed from {resume_path}  |  freeze_backbone={action_cfg.freeze_backbone}  "
+            f"|  frozen_stages={list(action_cfg.freeze_backbone_stages)}  "
             f"|  freeze_batchnorm_stats={action_cfg.freeze_batchnorm_stats}  "
             f"|  trainable params={n_trainable:,}"
         )
@@ -751,10 +755,19 @@ def train(
         imagenet_loaded = False
         if pretrained_imagenet:
             imagenet_loaded = model.try_load_imagenet_weights()
-        if action_cfg.freeze_backbone and not imagenet_loaded:
+        needs_pretrained = action_cfg.freeze_backbone or bool(
+            action_cfg.freeze_backbone_stages
+        )
+        if needs_pretrained and not imagenet_loaded:
             raise RuntimeError(
-                "action.freeze_backbone=true requires ImageNet backbone weights. "
-                "Either allow pretrained loading or set action.freeze_backbone=false."
+                "Freezing the backbone (full or selected stages) requires ImageNet "
+                "backbone weights. Either allow pretrained loading, clear "
+                "action.freeze_backbone_stages, or set action.freeze_backbone=false "
+                "with an empty freeze_backbone_stages list."
+            )
+        if action_cfg.freeze_backbone_stages and not action_cfg.freeze_backbone:
+            logger.info(
+                f"Frozen backbone stages: {list(action_cfg.freeze_backbone_stages)}"
             )
 
     label_smoothing = max(0.0, min(1.0, float(train_cfg.label_smoothing)))
@@ -826,13 +839,13 @@ def train(
     logger.info(
         "Validation sweeps threshold each epoch: "
         f"{train_cfg.threshold_sweep_min:.2f}..{train_cfg.threshold_sweep_max:.2f} "
-        f"step {train_cfg.threshold_sweep_step:.2f} "
-        f"(optimizing {best_metric_name}; fallback {fallback_threshold:.2f})"
+        f"step {train_cfg.threshold_sweep_step:.2f}"
     )
     logger.info(
         f"Checkpoint metric: {best_metric_name}  |  "
         f"Early stopping metric: {stop_metric_name}  |  "
-        f"patience={train_cfg.early_stopping_patience}"
+        f"patience={train_cfg.early_stopping_patience}  |  "
+        f"min_delta={train_cfg.min_delta}"
     )
 
     for epoch in range(1, train_cfg.epochs + 1):
@@ -952,8 +965,8 @@ def train(
         logger.info(
             f"epoch {epoch:03d} | train_loss {train_loss:.4f} acc {train_acc:.3f} "
             f"| val_loss {val_loss:.4f} acc {val_acc:.3f} f1 {val_f1:.3f} "
-            f"| split_clip_f1 {val_split_f1:.3f} "
-            f"split_event_f1 {val_event_f1:.3f} "
+            f"| split_step_clip_f1 {val_split_f1:.3f} "
+            f"split_step_event_f1 {val_event_f1:.3f} "
             f"thr {val_threshold:.2f}"
         )
 
@@ -963,7 +976,12 @@ def train(
             last_path,
             extra={"epoch": epoch, "ema_decay": ema_decay},
         )
-        checkpoint_improved = _metric_improved(val_score, best_score, best_metric_name)
+        checkpoint_improved = _metric_improved(
+            val_score,
+            best_score,
+            best_metric_name,
+            min_delta=train_cfg.min_delta,
+        )
         if checkpoint_improved:
             best_score = val_score
             best_f1 = val_f1
@@ -993,7 +1011,12 @@ def train(
                 f"saved to {best_path}"
             )
 
-        stop_improved = _metric_improved(stop_score, best_stop_score, stop_metric_name)
+        stop_improved = _metric_improved(
+            stop_score,
+            best_stop_score,
+            stop_metric_name,
+            min_delta=train_cfg.min_delta,
+        )
         if stop_improved:
             best_stop_score = stop_score
             epochs_without_improvement = 0
@@ -1126,8 +1149,8 @@ def train(
         )
         logger.info(
             f"Test  | loss {test_loss:.4f}  acc {test_acc:.3f}  f1 {test_f1:.3f} "
-            f"| split_clip_f1 {test_split_f1:.3f}  "
-            f"split_event_f1 "
+            f"| split_step_clip_f1 {test_split_f1:.3f}  "
+            f"split_step_event_f1 "
             f"{test_event_f1 if test_event_f1 is not None else float('nan'):.3f} "
             f"thr {best_threshold:.2f}"
         )

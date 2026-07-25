@@ -62,6 +62,7 @@ action:
   num_classes: 1           # 2 for cross_entropy; use 1 for BCEWithLogitsLoss
   backbone: resnet18
   freeze_backbone: false
+  freeze_backbone_stages: [conv1, layer1, layer2]  # fine-tune layer3/layer4 + head only when freeze_backbone is false
   freeze_batchnorm_stats: true # keep pretrained BN statistics fixed while fine-tuning
   lstm_hidden: 128
   lstm_layers: 1
@@ -71,29 +72,30 @@ action:
 
 # Smoothing of split-step label
 smoothing:
-  ema_alpha: 0.5           # EMA over per-frame split-step probability
-  prob_on: 0.45             # probability to flip to ON (must be sustained for min_on_frames)
-  prob_off: 0.35            # probability to flip back to OFF (must be sustained for cooldown_frames)
-  min_on_frames: 3         # minimum sustained frames to declare a split step
+  ema_alpha: 0.45           # EMA over per-frame split-step probability
+  prob_on: 0.4             # probability to flip to ON (must be sustained for min_on_frames)
+  prob_off: 0.3            # probability to flip back to OFF (must be sustained for cooldown_frames)
+  min_on_frames: 4         # minimum sustained frames to declare a split step
   cooldown_frames: 4        # minimum sustained low-prob frames to clear it
 
 # Training (action model)
 # Each train-action run writes to models/action_player_<N>/ (auto-incremented).
 train_action:
-  epochs: 30
+  epochs: 20
   batch_size: 32
-  lr: 0.00002              # fallback when backbone_lr/head_lr omitted
+  lr: 0.00003              # fallback when backbone_lr/head_lr omitted
   backbone_lr: 0.000002     # used when freeze_backbone=false (ResNet fine-tune)
-  head_lr: 0.00002         # BiLSTM + linear head
+  head_lr: 0.00003         # BiLSTM + linear head
   weight_decay: 0.05
   num_workers: 2
   val_split: 0.2
   loss: bce                # cross_entropy | bce
   class_weight_balance: false # event-balanced batches already rebalance positives
   label_smoothing: 0.05     # only used by cross_entropy
-  early_stopping_patience: 4
-  early_stopping_metric: split_event_f1
-  best_metric: split_event_f1       # primary deployment/checkpoint metric
+  early_stopping_patience: 3
+  early_stopping_metric: split_step_event_f1
+  min_delta: 0.003             # min improvement to count as better (checkpoint + early stop)
+  best_metric: split_step_event_f1  # primary deployment/checkpoint metric
   min_lr_ratio: 0.01          # cosine floor = lr * min_lr_ratio
   max_pos_weight: 2.0         # unused while class_weight_balance=false
   grad_clip_norm: 1.0
@@ -101,11 +103,11 @@ train_action:
   threshold_sweep_min: 0.3
   threshold_sweep_max: 0.6
   threshold_sweep_step: 0.01
-  ema_decay: 0.999          # 0 disables EMA; validation/checkpoints use EMA weights
+  ema_decay: 0.995          # 0 disables EMA; validation/checkpoints use EMA weights
   temperature_calibration: true # fit one logit temperature on val after training
   event_balanced_sampling: true
-  event_positive_fraction: 0.18
-  event_boundary_negative_fraction: 0.15
+  event_positive_fraction: 0.3
+  event_boundary_negative_fraction: 0.25
   event_boundary_radius_frames: 8
   event_match_tolerance_frames: 4  # event F1 match: overlap or within ±4 frames
   boundary_soft_label_radius_frames: 2  # training BCE targets only; 0 disables

@@ -11,7 +11,7 @@ label of the *last* frame in the rolling window.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 import torch
 import torch.nn as nn
@@ -28,6 +28,27 @@ _BACKBONE_FACTORIES = {
     "resnet34": (tvm.resnet34, 512),
     "mobilenet_v3_small": (tvm.mobilenet_v3_small, 576),
 }
+
+_RESNET_STAGE_NAMES = ("conv1", "layer1", "layer2", "layer3", "layer4")
+
+
+def _normalize_backbone_stages(stages: Optional[Iterable[str]]) -> List[str]:
+    """Validate and de-duplicate ResNet stage names."""
+    if stages is None:
+        return []
+    normalized: List[str] = []
+    for stage in stages:
+        name = str(stage).strip().lower()
+        if not name:
+            continue
+        if name not in _RESNET_STAGE_NAMES:
+            raise ValueError(
+                f"Unknown backbone stage '{stage}'. "
+                f"Supported: {list(_RESNET_STAGE_NAMES)}"
+            )
+        if name not in normalized:
+            normalized.append(name)
+    return normalized
 
 
 def _build_backbone(name: str) -> tuple[nn.Module, int]:
@@ -57,6 +78,7 @@ class SplitStepCNNLSTM(nn.Module):
         dropout: float = 0.2,
         feature_dropout: float = 0.25,
         freeze_backbone: bool = True,
+        freeze_backbone_stages: Optional[Sequence[str]] = None,
         freeze_batchnorm_stats: bool = False,
         temperature: float = 1.0,
     ) -> None:
@@ -84,6 +106,7 @@ class SplitStepCNNLSTM(nn.Module):
             nn.Linear(out_dim, num_classes),
         )
 
+        stages = _normalize_backbone_stages(freeze_backbone_stages)
         self.config = {
             "backbone": backbone_name,
             "num_classes": num_classes,
@@ -93,11 +116,14 @@ class SplitStepCNNLSTM(nn.Module):
             "dropout": dropout,
             "feature_dropout": feature_dropout,
             "freeze_backbone": freeze_backbone,
+            "freeze_backbone_stages": stages,
             "freeze_batchnorm_stats": self.freeze_batchnorm_stats,
             "temperature": self.temperature,
         }
 
         self.apply_freeze_backbone(freeze_backbone)
+        if not freeze_backbone:
+            self.apply_freeze_backbone_stages(stages)
 
     def train(self, mode: bool = True) -> "SplitStepCNNLSTM":
         """Set training mode while optionally keeping backbone BN stats fixed."""
@@ -109,10 +135,54 @@ class SplitStepCNNLSTM(nn.Module):
         return self
 
     def apply_freeze_backbone(self, freeze: bool) -> None:
-        """Toggle backbone gradient flow and persist the choice in ``config``."""
+        """Toggle full backbone gradient flow and persist the choice in ``config``."""
         for p in self.backbone.parameters():
             p.requires_grad = not freeze
         self.config["freeze_backbone"] = bool(freeze)
+        if not freeze:
+            # Re-apply any configured partial stage freeze after unfreezing.
+            self._set_stage_requires_grad(
+                _normalize_backbone_stages(self.config.get("freeze_backbone_stages"))
+            )
+
+    def apply_freeze_backbone_stages(
+        self,
+        stages: Optional[Sequence[str]] = None,
+    ) -> None:
+        """Freeze selected ResNet stages while leaving later stages trainable.
+
+        Ignored when ``freeze_backbone`` is already true (entire backbone frozen).
+        ``conv1`` also freezes ``bn1``. Only supported for ResNet backbones.
+        """
+        normalized = _normalize_backbone_stages(stages)
+        self.config["freeze_backbone_stages"] = list(normalized)
+        if self.config.get("freeze_backbone"):
+            return
+        for p in self.backbone.parameters():
+            p.requires_grad = True
+        self._set_stage_requires_grad(normalized)
+
+    def _set_stage_requires_grad(self, stages: Sequence[str]) -> None:
+        if not stages:
+            return
+        backbone_name = str(self.config.get("backbone", ""))
+        if not backbone_name.startswith("resnet"):
+            raise ValueError(
+                "freeze_backbone_stages is only supported for ResNet backbones "
+                f"(got '{backbone_name}')."
+            )
+        for stage in stages:
+            for module in self._stage_modules(stage):
+                for parameter in module.parameters():
+                    parameter.requires_grad = False
+
+    def _stage_modules(self, stage: str) -> List[nn.Module]:
+        if stage == "conv1":
+            modules: List[nn.Module] = [self.backbone.conv1]
+            if hasattr(self.backbone, "bn1"):
+                modules.append(self.backbone.bn1)
+            return modules
+        return [getattr(self.backbone, stage)]
 
     def apply_freeze_batchnorm_stats(self, freeze: bool) -> None:
         """Toggle automatic freezing of backbone BatchNorm running statistics."""
@@ -199,6 +269,7 @@ def build_model(cfg: ActionConfig) -> SplitStepCNNLSTM:
         dropout=cfg.dropout,
         feature_dropout=cfg.feature_dropout,
         freeze_backbone=cfg.freeze_backbone,
+        freeze_backbone_stages=cfg.freeze_backbone_stages,
         freeze_batchnorm_stats=cfg.freeze_batchnorm_stats,
         temperature=1.0,
     )
@@ -234,6 +305,7 @@ def load_checkpoint(
         dropout=cfg.get("dropout", 0.2),
         feature_dropout=cfg.get("feature_dropout", 0.0),
         freeze_backbone=cfg.get("freeze_backbone", True),
+        freeze_backbone_stages=cfg.get("freeze_backbone_stages", []),
         freeze_batchnorm_stats=cfg.get("freeze_batchnorm_stats", False),
         temperature=cfg.get("temperature", 1.0),
     )

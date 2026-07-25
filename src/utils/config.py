@@ -85,6 +85,9 @@ class ActionConfig:
     num_classes: int = 2
     backbone: str = "resnet18"
     freeze_backbone: bool = True
+    # Partial ResNet freeze when freeze_backbone=false, e.g. [conv1, layer1, layer2].
+    # ``conv1`` also freezes its BatchNorm (``bn1``). Ignored when freeze_backbone=true.
+    freeze_backbone_stages: List[str] = field(default_factory=list)
     freeze_batchnorm_stats: bool = False
     lstm_hidden: int = 128
     lstm_layers: int = 1
@@ -117,6 +120,7 @@ class TrainActionConfig:
     label_smoothing: float = 0.0
     early_stopping_patience: int = 0
     early_stopping_metric: str = "val_loss"
+    min_delta: float = 0.0
     best_metric: str = "macro_f1"
     classification_threshold: float = 0.5
     min_lr_ratio: float = 0.05
