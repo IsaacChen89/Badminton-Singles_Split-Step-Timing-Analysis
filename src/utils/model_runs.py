@@ -10,6 +10,8 @@ from typing import Any, Optional
 MODELS_DIR = Path("models")
 YOLO_KIND = "yolo_player"
 ACTION_KIND = "action_player"
+YOLO_WEIGHTS_BEST = Path("weights") / "best.pt"
+# Legacy promoted copy (older runs); inference prefers weights/best.pt.
 YOLO_BEST_NAME = "yolo_player_best.pt"
 ACTION_BEST_NAME = "action_best.pt"
 RUN_INFO_NAME = "run_info.json"
@@ -88,13 +90,17 @@ def _verify_checkpoint_payload(run_dir: Path, payload: dict[str, Any]) -> None:
 
 
 def yolo_checkpoint_in_dir(run_dir: Path) -> Optional[Path]:
-    """Best fine-tuned YOLO weights inside a run directory."""
+    """Best fine-tuned YOLO weights inside a run directory.
+
+    Prefers Ultralytics ``weights/best.pt``. Falls back to a legacy
+    ``yolo_player_best.pt`` copy if present.
+    """
+    weights_best = run_dir / YOLO_WEIGHTS_BEST
+    if weights_best.is_file():
+        return weights_best.resolve()
     promoted = run_dir / YOLO_BEST_NAME
     if promoted.is_file():
         return promoted.resolve()
-    weights_best = run_dir / "weights" / "best.pt"
-    if weights_best.is_file():
-        return weights_best.resolve()
     return None
 
 

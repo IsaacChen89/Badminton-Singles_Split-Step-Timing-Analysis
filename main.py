@@ -114,7 +114,7 @@ def analyze(
     device: Optional[str] = typer.Option(None, "--device", help="auto|cpu|cuda|mps"),
     yolo_weights: Optional[Path] = typer.Option(None, "--yolo-weights", help="Override detector weights path."),
     yolo_run: Optional[int] = typer.Option(
-        None, "--yolo-run", min=1, help="Use models/yolo_player_<N>/yolo_player_best.pt."
+        None, "--yolo-run", min=1, help="Use models/yolo_player_<N>/weights/best.pt."
     ),
     action_weights: Optional[Path] = typer.Option(None, "--action-weights", help="Override action checkpoint path."),
     action_run: Optional[int] = typer.Option(
@@ -521,7 +521,6 @@ def train_yolo(
     from src.utils.model_runs import YOLO_KIND, allocate_run_dir, project_relative
     from src.utils.yolo_weights import (
         MODELS_DIR,
-        promote_finetuned_best,
         remove_stray_root_weight,
         resolve_yolo_weight,
         ultralytics_weights_cwd,
@@ -557,10 +556,12 @@ def train_yolo(
     remove_stray_root_weight("yolo26n-cls.pt", keep=MODELS_DIR / "yolo26n-cls.pt")
 
     best_src = save_dir / "weights" / "best.pt"
-    promoted = promote_finetuned_best(save_dir)
-    if promoted:
-        logger.info(f"Fine-tuned detector for analyze: {promoted}")
-    checkpoint = project_relative(promoted or best_src)
+    if not best_src.is_file():
+        raise FileNotFoundError(
+            f"YOLO training finished but {best_src} was not written."
+        )
+    checkpoint = project_relative(best_src)
+    logger.info(f"Fine-tuned detector for analyze: {checkpoint}")
     logger.info(
         f"YOLO training complete (run {run}). "
         f"Analyze with: --yolo-run {run}  ({checkpoint})"

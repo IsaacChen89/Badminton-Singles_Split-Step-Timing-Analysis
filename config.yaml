@@ -19,7 +19,7 @@ pipeline:
 # Detection (YOLO)
 detection:
   model_path: models/yolo26n.pt  # stock base weights; ultralytics cache if missing
-  finetuned_model_path: models/yolo_player/yolo_player_best.pt  # legacy; prefer --yolo-run N
+  finetuned_model_path: models/yolo_player/weights/best.pt  # legacy; prefer --yolo-run N
   conf_threshold: 0.35
   iou_threshold: 0.5      # kept for API compat; YOLO26 is NMS-free at inference
   imgsz: 640

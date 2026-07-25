@@ -1,20 +1,19 @@
 """Resolve YOLO checkpoint paths and avoid stray root downloads.
 
 Stock base weights (``yolo26n.pt``, ``yolo26n-cls.pt``) live under ``models/``.
-Fine-tuned detector runs and ``yolo_player_best.pt`` live under ``models/yolo_player/``.
+Fine-tuned detector runs live under ``models/yolo_player_<N>/`` with
+Ultralytics ``weights/best.pt`` (no promoted ``yolo_player_best.pt`` copy).
 """
 
 from __future__ import annotations
 
 import os
-import shutil
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator, Optional
 
 MODELS_DIR = Path("models")
 YOLO_PLAYER_DIR = MODELS_DIR / "yolo_player"
-FINETUNED_BASENAME = "yolo_player_best.pt"
 
 
 def resolve_yolo_weight(spec: str) -> Path:
@@ -57,14 +56,3 @@ def ultralytics_weights_cwd(directory: Path) -> Iterator[None]:
         yield
     finally:
         os.chdir(previous)
-
-
-def promote_finetuned_best(save_dir: Path) -> Optional[Path]:
-    """Copy ``<save_dir>/weights/best.pt`` → ``<save_dir>/yolo_player_best.pt``."""
-    best = save_dir / "weights" / "best.pt"
-    if not best.is_file():
-        return None
-    save_dir.mkdir(parents=True, exist_ok=True)
-    dest = save_dir / FINETUNED_BASENAME
-    shutil.copy2(best, dest)
-    return dest.resolve()
